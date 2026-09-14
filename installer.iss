@@ -1,0 +1,47 @@
+; Script Inno Setup de tao bo cai dat (Setup.exe) cho GCode Vision tren Windows.
+; Chay tren may Windows (hoac GitHub Actions windows-latest) bang Inno Setup 6:
+;   iscc installer.iss
+; Yeu cau: da build san file portable bang PyInstaller vao dist\GCode-Vision.exe
+; (xem .github/workflows/build.yml) truoc khi chay script nay.
+
+#define MyAppName "GCode Vision"
+#define MyAppVersion "1.0.0"
+#define MyAppPublisher "Tran Van Huy"
+#define MyAppURL "https://www.tranvanhuy.io.vn"
+#define MyAppExeName "GCode-Vision.exe"
+
+[Setup]
+AppId={{B7B6B1B0-2C1C-4D6E-9C4C-1F6E9C6C5A11}
+AppName={#MyAppName}
+AppVersion={#MyAppVersion}
+AppPublisher={#MyAppPublisher}
+AppPublisherURL={#MyAppURL}
+AppSupportURL={#MyAppURL}
+DefaultDirName={autopf}\{#MyAppName}
+DefaultGroupName={#MyAppName}
+DisableProgramGroupPage=yes
+OutputDir=installer_output
+OutputBaseFilename=GCodeVision-Setup-{#MyAppVersion}
+SetupIconFile=logo.ico
+Compression=lzma
+SolidCompression=yes
+WizardStyle=modern
+UninstallDisplayIcon={app}\{#MyAppExeName}
+ArchitecturesInstallIn64BitMode=x64
+
+[Languages]
+Name: "english"; MessagesFile: "compiler:Default.isl"
+
+[Tasks]
+Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
+
+[Files]
+Source: "dist\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+
+[Icons]
+Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+Name: "{group}\{cm:UninstallProgram,{#MyAppName}}"; Filename: "{uninstallexe}"
+
+[Run]
+Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent

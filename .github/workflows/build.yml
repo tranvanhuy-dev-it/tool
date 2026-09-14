@@ -1,4 +1,4 @@
-name: Build Windows EXE
+name: Build Windows EXE và Bộ cài đặt
 
 on:
   push:
@@ -23,14 +23,28 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: Build EXE
+      - name: Build portable EXE
         run: |
           pyinstaller --noconfirm --onefile --windowed `
-            --name "CNC-Gcode-Designer" `
+            --name "GCode-Vision" `
+            --icon "logo.ico" `
             main_window.py
 
-      - name: Upload EXE artifact
+      - name: Upload portable EXE artifact
         uses: actions/upload-artifact@v4
         with:
-          name: CNC-Gcode-Designer-windows
-          path: dist/CNC-Gcode-Designer.exe
+          name: GCode-Vision-portable-exe
+          path: dist/GCode-Vision.exe
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y
+
+      - name: Build installer (Setup.exe)
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GCode-Vision-installer
+          path: installer_output/*.exe
