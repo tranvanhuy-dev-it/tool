@@ -45,3 +45,36 @@ Name: "{group}\{cm:UninstallProgram,{#MyAppName}}"; Filename: "{uninstallexe}"
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
+
+[Code]
+{ Yeu cau nguoi dung nhap dung mat khau TRUOC KHI qua trinh cai dat bat dau,
+  de kiem soat ai co the cai duoc ung dung tu file Setup.exe nay. Mat khau nay
+  chi bao ve o muc "nguoi thuong khong the tu cai" - repo la Private nen chap
+  nhan duoc, nhung day KHONG phai ma hoa/bao mat manh (ai co source deu doc
+  duoc plain-text nay). Doi INSTALLER_PASSWORD o day khi can thay mat khau. }
+const
+  INSTALLER_PASSWORD = 'hichan26032006@';
+
+var
+  PasswordPage: TInputQueryWizardPage;
+
+procedure InitializeWizard();
+begin
+  PasswordPage := CreateInputQueryPage(wpWelcome,
+    'Yêu cầu mật khẩu', 'Bộ cài đặt này được bảo vệ bằng mật khẩu',
+    'Vui lòng nhập mật khẩu do người quản lý cung cấp để tiếp tục cài đặt GCode Vision.');
+  PasswordPage.Add('Mật khẩu:', True); { True = an ky tu nhap (hien dau *) }
+end;
+
+function NextButtonClick(CurPageID: Integer): Boolean;
+begin
+  Result := True;
+  if CurPageID = PasswordPage.ID then
+  begin
+    if PasswordPage.Values[0] <> INSTALLER_PASSWORD then
+    begin
+      MsgBox('Mật khẩu không đúng. Vui lòng thử lại.', mbError, MB_OK);
+      Result := False;
+    end;
+  end;
+end;
