@@ -9,9 +9,12 @@ truc Y huong LEN (giong ban ve co khi / CNC thuc te), khac voi he toa do
 man hinh mac dinh cua Qt (goc tren trai, Y huong xuong) -> can quy doi.
 """
 
-from PyQt5.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsLineItem, QGraphicsPixmapItem
-from PyQt5.QtGui import QPen, QColor, QPainter, QFont, QPixmap
-from PyQt5.QtCore import Qt, QPointF, pyqtSignal
+from PyQt5.QtWidgets import (
+    QGraphicsView, QGraphicsScene, QGraphicsLineItem, QGraphicsPixmapItem,
+    QGraphicsEllipseItem, QGraphicsItem,
+)
+from PyQt5.QtGui import QPen, QColor, QBrush, QPainter, QFont, QPixmap
+from PyQt5.QtCore import Qt, QPointF, pyqtSignal, QRectF
 
 from gcode_parser import ParseResult, Segment, arc_to_polyline
 
@@ -34,15 +37,31 @@ class CanvasWidget(QGraphicsView):
         self.setRenderHint(QPainter.Antialiasing)
         self.setMouseTracking(True)
         self.setBackgroundBrush(QColor("#ffffff"))
+        # zoom bang cuon chuot se lay TAM la vi tri con tro, khong phai tam khung nhin
+        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.AnchorViewCenter)
 
         self._last_click_mm = None   # diem click gan nhat, dung cho toa do tuong doi
         self._origin_px = QPointF(MARGIN_PX, 0)  # cap nhat khi resize/draw
         self._segments: list[Segment] = []
+        self._has_fitted_once = False  # chi tu dong fitInView() o lan render dau tien
+        self._user_has_zoomed = False  # danh dau nguoi dung da tu thu phong/di chuyen
 
-        self._pen_cut = QPen(QColor("#1e293b"), 1.4)
-        self._pen_rapid = QPen(QColor("#94a3b8"), 1.0, Qt.DashLine)
-        self._pen_axis = QPen(QColor("#ef4444"), 1.2)
-        self._pen_grid = QPen(QColor("#e5e7eb"), 0.6)
+        self._colors = dict(
+            cut="#1e293b", rapid="#94a3b8", axis="#ef4444",
+            grid="#e5e7eb", hover="#3b9eff",
+        )
+        self._pen_cut = QPen(QColor(self._colors["cut"]), 1.4)
+        self._pen_rapid = QPen(QColor(self._colors["rapid"]), 1.0, Qt.DashLine)
+        self._pen_axis = QPen(QColor(self._colors["axis"]), 1.2)
+        self._pen_grid = QPen(QColor(self._colors["grid"]), 0.6)
+
+        self._hover_marker_items: list = []  # vong tron + 2 duong crosshair khi hover gan giao diem luoi
+        self._press_pos = None    # vi tri bat dau nhan chuot trai, de phan biet click voi keo
+        self._last_drag_pos = None
+        self._is_dragging = False
+        self._pen_hover_line = QPen(QColor(self._colors["hover"]), 1.2, Qt.DashLine)
+        self._last_grid_bounds = (0.0, 0.0, 0.0, 0.0)  # min_x,max_x,min_y,max_y cua luoi hien tai
 
         # --- anh nen (ban ve tham chieu, da duoc crop khop khung phoi) ---
         # Quy uoc: goc DUOI-TRAI cua anh (pixel (0, image_height)) la moc tham chieu.
@@ -61,8 +80,18 @@ class CanvasWidget(QGraphicsView):
         self._grid_step_mm = 5.0
         self._snap_enabled = True
         self._snap_radius_px = 10.0  # ban kinh hut luoi, tinh theo PIXEL MAN HINH (khong doi theo zoom)
+        self._marker_radius_px = 9.0  # ban kinh vong tron danh dau diem giao khi hover, tinh theo PIXEL MAN HINH
 
     # ---------- anh nen ----------
+
+    def clear_background_image(self):
+        if self._bg_pixmap_item is not None:
+            self.scene.removeItem(self._bg_pixmap_item)
+            self._bg_pixmap_item = None
+        self._bg_image_path = None
+        self._bg_source_pixmap = None
+        self._bg_image_w_px = 1.0
+        self._bg_image_h_px = 1.0
 
     def set_background_image(self, path: str):
         pix = QPixmap(path)
@@ -134,13 +163,74 @@ class CanvasWidget(QGraphicsView):
     def scene_to_mm(self, pt: QPointF) -> tuple[float, float]:
         return (pt.x() / MM_TO_PX, -pt.y() / MM_TO_PX)
 
+    # ---------- mau sac ----------
+
+    def set_colors(self, cut=None, rapid=None, axis=None, grid=None, hover=None):
+        """Doi mau cac loai net ve. Truyen gia tri hex (vd '#ff0000') cho loai can doi,
+        bo qua (None) de giu nguyen loai khac."""
+        if cut:
+            self._colors["cut"] = cut
+            self._pen_cut = QPen(QColor(cut), 1.4)
+        if rapid:
+            self._colors["rapid"] = rapid
+            self._pen_rapid = QPen(QColor(rapid), 1.0, Qt.DashLine)
+        if axis:
+            self._colors["axis"] = axis
+            self._pen_axis = QPen(QColor(axis), 1.2)
+        if grid:
+            self._colors["grid"] = grid
+            self._pen_grid = QPen(QColor(grid), 0.6)
+        if hover:
+            self._colors["hover"] = hover
+
+    def get_colors(self) -> dict:
+        return dict(self._colors)
+
     # ---------- ve lai toan bo ----------
 
+    def fit_view(self):
+        """Can lai khung nhin de thay toan bo ban ve va phoi - can vua theo man hinh.
+        Co chan tai nhap (re-entrancy guard) vi fitInView() co the tu kich hoat
+        resizeEvent noi bo cua Qt, ma resizeEvent lai goi fit_view() -> neu khong
+        chan se gay de quy vo han va treo ung dung."""
+        if getattr(self, "_in_fit_view", False):
+            return
+        self._in_fit_view = True
+        try:
+            if getattr(self, "_main_bounds_mm", None):
+                min_x, max_x, min_y, max_y = self._main_bounds_mm
+                pad_x = max(6.0, (max_x - min_x) * 0.08)
+                pad_y = max(6.0, (max_y - min_y) * 0.08)
+                p1 = self.mm_to_scene(min_x - pad_x, max_y + pad_y)
+                p2 = self.mm_to_scene(max_x + pad_x, min_y - pad_y)
+                rect = QRectF(p1, p2).normalized()
+            else:
+                rect = self.scene.itemsBoundingRect().adjusted(-10, -10, 10, 10)
+
+            if rect.isValid() and not rect.isEmpty():
+                self.fitInView(rect, Qt.KeepAspectRatio)
+                self._user_has_zoomed = False
+        finally:
+            self._in_fit_view = False
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if not getattr(self, '_user_has_zoomed', False) and getattr(self, '_has_fitted_once', False):
+            self.fit_view()
+
     def render_program(self, result: ParseResult, sheet_w: float = None, sheet_h: float = None):
-        self.scene.clear()
+        # luu lai transform (zoom/pan) hien tai truoc khi xoa scene, vi scene.clear()
+        # khong lam mat transform cua view, nhung ta van can fitInView co kiem soat
         self._bg_pixmap_item = None  # da bi xoa boi scene.clear()
+        self._hover_marker_items = []
+        self.scene.clear()
         self._redraw_background()
         self._segments = result.segments
+
+        # Khi chua co doan G-code nao (vd vua mo ung dung, editor con trong), hien thi
+        # san mot he truc toa do co kich thuoc mac dinh de nguoi dung de hinh dung,
+        # voi goc (0,0) nam o GOC DUOI-TRAI cua khung nhin (khong phai o giua).
+        DEFAULT_VIEW_SIZE_MM = 200.0
 
         xs, ys = [0.0], [0.0]
         for seg in result.segments:
@@ -155,13 +245,27 @@ class CanvasWidget(QGraphicsView):
             xs += [ax, ax + img_w_mm]
             ys += [ay, ay + img_h_mm]
 
-        min_x, max_x = min(xs) - 10, max(xs) + 10
-        min_y, max_y = min(ys) - 10, max(ys) + 10
+        actual_w = max(xs)
+        actual_h = max(ys)
         if sheet_w:
-            max_x = max(max_x, sheet_w + 10)
+            actual_w = max(actual_w, sheet_w)
         if sheet_h:
-            max_y = max(max_y, sheet_h + 10)
+            actual_h = max(actual_h, sheet_h)
 
+        if not result.segments and self._bg_image_path is None and not sheet_w and not sheet_h:
+            actual_w = DEFAULT_VIEW_SIZE_MM
+            actual_h = DEFAULT_VIEW_SIZE_MM
+
+        min_work_x = min(0.0, min(xs))
+        min_work_y = min(0.0, min(ys))
+        self._main_bounds_mm = (min_work_x, actual_w, min_work_y, actual_h)
+
+        min_x = min_work_x - 5
+        max_x = actual_w + 5
+        min_y = min_work_y - 5
+        max_y = actual_h + 5
+
+        self._last_grid_bounds = (min_x, max_x, min_y, max_y)
         self._draw_grid(min_x, max_x, min_y, max_y)
         self._draw_axes(min_x, max_x, min_y, max_y)
 
@@ -181,9 +285,15 @@ class CanvasWidget(QGraphicsView):
         self.scene.addEllipse(p.x() - r, p.y() - r, 2 * r, 2 * r,
                                QPen(QColor("#16a34a"), 1.5))
 
-        rect = self.scene.itemsBoundingRect().adjusted(-20, -20, 20, 20)
+        rect = self.scene.itemsBoundingRect().adjusted(-10, -10, 10, 10)
         self.scene.setSceneRect(rect)
-        self.fitInView(rect, Qt.KeepAspectRatio)
+
+        # CHI can khung nhin tu dong o lan render DAU TIEN (vd luc vua mo file/vua go
+        # chuong trinh moi). Nhung lan sau (go them dong, doi mau, doi thong so anh...)
+        # GIU NGUYEN vi tri zoom/pan hien tai cua nguoi dung thay vi reset ve fit toan bo.
+        if not self._has_fitted_once:
+            self.fit_view()
+            self._has_fitted_once = True
 
     def _line_coords(self, x0, y0, x1, y1):
         p0 = self.mm_to_scene(x0, y0)
@@ -214,10 +324,10 @@ class CanvasWidget(QGraphicsView):
 
     # ---------- tuong tac chuot ----------
     #
-    # - Chuot trai: chen toa do tai diem click (hanh vi chinh).
+    # - Chuot trai (click don gian, khong keo): chon/chen toa do tai diem click.
+    # - Chuot trai (giu va keo qua nguong _DRAG_THRESHOLD_PX): pan (di chuyen hinh ve).
     # - Chuot phai: yeu cau hoan tac thao tac chen gan nhat (undo).
-    # - Ctrl + keo chuot trai: pan (di chuyen) hinh ve thay vi chen toa do.
-    # - Cuon chuot (wheel): zoom, khong doi.
+    # - Cuon chuot (wheel): zoom quanh vi tri con tro.
     # - Di chuyen chuot: bao toa do hien tai (co snap luoi) de hien o status bar.
 
     def set_snap_enabled(self, enabled: bool):
@@ -225,6 +335,9 @@ class CanvasWidget(QGraphicsView):
 
     def set_snap_radius(self, radius_px: float):
         self._snap_radius_px = max(0.0, radius_px)
+
+    def set_marker_radius(self, radius_px: float):
+        self._marker_radius_px = max(1.0, radius_px)
 
     def _mm_at_pos(self, pos) -> tuple[float, float]:
         """Toa do mm tai vi tri con tro man hinh, da hut vao giao diem luoi gan nhat
@@ -248,33 +361,125 @@ class CanvasWidget(QGraphicsView):
             return gx_mm, gy_mm
         return x_mm, y_mm
 
+    # Nguong (pixel) de phan biet "click chon diem" voi "giu va keo de di chuyen":
+    # neu chuot di chuyen qua nguong nay trong luc dang giu nut trai, coi la keo (pan),
+    # neu khong (tha chuot ma chua di chuyen qua nguong) thi coi la click chon diem.
+    _DRAG_THRESHOLD_PX = 4
+
     def mousePressEvent(self, event):
         if event.button() == Qt.RightButton:
             self.undo_requested.emit()
             return
         if event.button() == Qt.LeftButton:
-            if event.modifiers() & Qt.ControlModifier:
-                self.setDragMode(QGraphicsView.ScrollHandDrag)
-                super().mousePressEvent(event)
-                return
-            x_mm, y_mm = self._mm_at_pos(event.pos())
-            x_mm = round(x_mm, 6)
-            y_mm = round(y_mm, 6)
-            self._last_click_mm = (x_mm, y_mm)
-            self.point_clicked.emit(x_mm, y_mm)
+            self._press_pos = event.pos()
+            self._last_drag_pos = event.pos()
+            self._is_dragging = False
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
         x_mm, y_mm = self._mm_at_pos(event.pos())
         self.mouse_moved_mm.emit(x_mm, y_mm)
+        self._update_hover_marker(event.pos(), x_mm, y_mm)
+
+        if event.buttons() & Qt.LeftButton and getattr(self, "_press_pos", None) is not None:
+            if not getattr(self, "_is_dragging", False):
+                delta = event.pos() - self._press_pos
+                if (delta.x() ** 2 + delta.y() ** 2) ** 0.5 >= self._DRAG_THRESHOLD_PX:
+                    self._is_dragging = True
+                    self._user_has_zoomed = True
+                    self.setCursor(Qt.ClosedHandCursor)
+
+            if getattr(self, "_is_dragging", False):
+                # Pan bang cach dich chuyen truc tiep thanh cuon, khong dung
+                # ScrollHandDrag cua Qt (tranh phai gia lap lai mousePressEvent).
+                d = event.pos() - self._last_drag_pos
+                self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - d.x())
+                self.verticalScrollBar().setValue(self.verticalScrollBar().value() - d.y())
+                self._last_drag_pos = event.pos()
+
         super().mouseMoveEvent(event)
 
+    def _update_hover_marker(self, pos, x_mm: float, y_mm: float):
+        """Sang duong luoi gan con tro de de dinh vi:
+          - Neu con tro du gan mot GIAO DIEM luoi (ca 2 truc, tuc _mm_at_pos da snap):
+            sang CA 2 duong (ngang + doc) kieu crosshair, kem vong tron highlight.
+          - Neu chi gan MOT duong luoi don le (chi 1 truc, chua du gan giao diem):
+            chi sang DUONG DO (ngang hoac doc), khong hien vong tron."""
+        for item in self._hover_marker_items:
+            self.scene.removeItem(item)
+        self._hover_marker_items = []
+
+        if not self._snap_enabled or self._grid_step_mm <= 0:
+            return
+
+        step = self._grid_step_mm
+        gx_mm = round(x_mm / step) * step
+        gy_mm = round(y_mm / step) * step
+
+        # khoang cach tren MAN HINH (px) tu con tro den duong luoi doc (X=gx_mm)
+        # va duong luoi ngang (Y=gy_mm) gan nhat, de so sanh voi ban kinh snap.
+        vx_screen = self.mapFromScene(self.mm_to_scene(gx_mm, y_mm))
+        hy_screen = self.mapFromScene(self.mm_to_scene(x_mm, gy_mm))
+        dist_v = abs(vx_screen.x() - pos.x())
+        dist_h = abs(hy_screen.y() - pos.y())
+
+        near_v = dist_v <= self._snap_radius_px
+        near_h = dist_h <= self._snap_radius_px
+        is_snapped = near_v and near_h
+
+        min_x, max_x, min_y, max_y = self._last_grid_bounds
+
+        if is_snapped:
+            hover_color = QColor(self._colors["hover"])
+
+            line_h = self.scene.addLine(*self._line_coords(min_x, gy_mm, max_x, gy_mm), self._pen_hover_line)
+            line_v = self.scene.addLine(*self._line_coords(gx_mm, min_y, gx_mm, max_y), self._pen_hover_line)
+            line_h.setZValue(40)
+            line_v.setZValue(40)
+            self._hover_marker_items += [line_h, line_v]
+
+            # Ban kinh CO DINH theo PIXEL MAN HINH (khong to/nho theo zoom): dat co
+            # ItemIgnoresTransformations, ve hinh quanh goc (0,0) roi setPos() den
+            # dung vi tri scene - Qt se giu nguyen kich thuoc hien thi bat ke zoom.
+            center = self.mm_to_scene(gx_mm, gy_mm)
+            r = self._marker_radius_px
+            marker = self.scene.addEllipse(
+                -r, -r, 2 * r, 2 * r,
+                QPen(hover_color, 1.6),
+                QBrush(hover_color.lighter(160)),
+            )
+            marker.setFlag(QGraphicsItem.ItemIgnoresTransformations, True)
+            marker.setPos(center)
+            marker.setZValue(50)
+            self._hover_marker_items.append(marker)
+        elif near_v:
+            line_v = self.scene.addLine(*self._line_coords(gx_mm, min_y, gx_mm, max_y), self._pen_hover_line)
+            line_v.setZValue(40)
+            self._hover_marker_items.append(line_v)
+        elif near_h:
+            line_h = self.scene.addLine(*self._line_coords(min_x, gy_mm, max_x, gy_mm), self._pen_hover_line)
+            line_h.setZValue(40)
+            self._hover_marker_items.append(line_h)
+
     def mouseReleaseEvent(self, event):
-        if event.button() == Qt.LeftButton and self.dragMode() == QGraphicsView.ScrollHandDrag:
-            self.setDragMode(QGraphicsView.NoDrag)
+        if event.button() == Qt.LeftButton:
+            was_dragging = getattr(self, "_is_dragging", False)
+            if was_dragging:
+                self.setCursor(Qt.ArrowCursor)
+            else:
+                # tha chuot ma chua tung vuot qua nguong keo -> la mot cai click don
+                # gian, chon toa do tai vi tri hien tai (co snap luoi neu du gan).
+                x_mm, y_mm = self._mm_at_pos(event.pos())
+                x_mm = round(x_mm, 6)
+                y_mm = round(y_mm, 6)
+                self._last_click_mm = (x_mm, y_mm)
+                self.point_clicked.emit(x_mm, y_mm)
+            self._press_pos = None
+            self._is_dragging = False
         super().mouseReleaseEvent(event)
 
     def wheelEvent(self, event):
+        self._user_has_zoomed = True
         factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
         self.scale(factor, factor)
 
