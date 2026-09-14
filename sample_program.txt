@@ -1,0 +1,48 @@
+; Chuong trinh mau minh hoa cac dang bien dang CNC thuong gap:
+;  - duong thang, vat goc (chamfer)
+;  - lo tron (dung G2 full circle)
+;  - bo goc bang cung tron (G2/G3)
+;  - ranh (rectangular slot)
+; Day KHONG phai ban sao chinh xac cua mot ban ve cu the, ma la vi du
+; tong hop de kiem tra kha nang cua phan mem voi nhieu dang hinh hoc khac nhau.
+
+G90                  ; che do toa do tuyet doi
+
+; --- bien dang ngoai: hinh chu nhat vat 4 goc (chamfer) ---
+G0 X10 Y0
+G1 X90 Y0
+G1 X100 Y10
+G1 X100 Y50
+G1 X90 Y60
+G1 X10 Y60
+G1 X0 Y50
+G1 X0 Y10
+G1 X10 Y0
+
+; --- ranh chu nhat o giua canh tren ---
+G0 X45 Y60
+G1 X45 Y54
+G1 X55 Y54
+G1 X55 Y60
+
+; --- bo goc bang cung tron: hinh chu nhat 30x20 bo goc R5, goc duoi trai tai (20,15) ---
+G0 X25 Y15
+G1 X45 Y15
+G2 X50 Y20 I0 J5
+G1 X50 Y30
+G2 X45 Y35 I-5 J0
+G1 X25 Y35
+G2 X20 Y30 I0 J-5
+G1 X20 Y20
+G2 X25 Y15 I5 J0
+
+; --- lo tron duong kinh 8mm (R4), tam tai (75,20) ---
+G0 X79 Y20
+G2 X79 Y20 I-4 J0
+
+; --- vi du dung he toa do TUONG DOI (G91) de ve mot tam giac nho ---
+G91
+G1 X10 Y0
+G1 X-5 Y8
+G1 X-5 Y-8
+G90
