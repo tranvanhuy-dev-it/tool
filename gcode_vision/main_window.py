@@ -29,10 +29,10 @@ from PyQt5.QtGui import QFont, QSyntaxHighlighter, QTextCharFormat, QColor, QIco
 from PyQt5.QtCore import Qt
 import re
 
-from gcode_parser import parse_gcode
-from canvas_widget import CanvasWidget
-from gcode_editor import GcodeEditor
-from ruler_dialog import RulerWidget, RULER_THICKNESS
+from gcode_vision.gcode_parser import parse_gcode
+from gcode_vision.canvas_widget import CanvasWidget
+from gcode_vision.gcode_editor import GcodeEditor
+from gcode_vision.ruler_dialog import RulerWidget, RULER_THICKNESS
 
 
 class GcodeHighlighter(QSyntaxHighlighter):
@@ -64,7 +64,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("GCode Vision")
-        logo_path = os.path.join(os.path.dirname(__file__), "logo.png")
+        logo_path = os.path.join(os.path.dirname(__file__), "..", "assets", "logo.png")
         if os.path.exists(logo_path):
             self.setWindowIcon(QIcon(logo_path))
         self.resize(1400, 850)

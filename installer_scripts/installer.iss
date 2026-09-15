@@ -1,6 +1,7 @@
 ; Script Inno Setup de tao bo cai dat (Setup.exe) cho GCode Vision tren Windows.
-; Chay tren may Windows (hoac GitHub Actions windows-latest) bang Inno Setup 6:
-;   iscc installer.iss
+; Chay tren may Windows (hoac GitHub Actions windows-latest) bang Inno Setup 6,
+; TU THU MUC GOC cua du an (khong phai tu installer_scripts\):
+;   iscc installer_scripts\installer.iss
 ; Yeu cau: da build san file portable bang PyInstaller vao dist\GCode-Vision.exe
 ; (xem .github/workflows/build.yml) truoc khi chay script nay.
 
@@ -20,9 +21,9 @@ AppSupportURL={#MyAppURL}
 DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
-OutputDir=installer_output
+OutputDir=..\installer_output
 OutputBaseFilename=GCodeVision-Setup-{#MyAppVersion}
-SetupIconFile=logo.ico
+SetupIconFile=..\assets\logo.ico
 Compression=lzma
 SolidCompression=yes
 WizardStyle=modern
@@ -36,7 +37,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-Source: "dist\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\dist\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"

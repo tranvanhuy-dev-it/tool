@@ -16,8 +16,8 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtGui import QPen, QColor, QBrush, QPainter, QFont, QPixmap
 from PyQt5.QtCore import Qt, QPointF, pyqtSignal, QRectF
 
-from gcode_parser import ParseResult, Segment, arc_to_polyline
-from ruler_calibration import AxisCalibration
+from gcode_vision.gcode_parser import ParseResult, Segment, arc_to_polyline
+from gcode_vision.ruler_calibration import AxisCalibration
 
 MM_TO_PX = 4.0          # ty le hien thi: 1 mm ban ve = 4 px man hinh
 MARGIN_PX = 40           # le trang de con hien thi truc va nhan toa do

@@ -27,8 +27,8 @@ jobs:
         run: |
           pyinstaller --noconfirm --onefile --windowed `
             --name "GCode-Vision" `
-            --icon "logo.ico" `
-            main_window.py
+            --icon "assets\logo.ico" `
+            run.py
 
       - name: Upload portable EXE artifact
         uses: actions/upload-artifact@v4
@@ -41,7 +41,7 @@ jobs:
 
       - name: Build installer (Setup.exe)
         run: |
-          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer_scripts\installer.iss
 
       - name: Upload installer artifact
         uses: actions/upload-artifact@v4
