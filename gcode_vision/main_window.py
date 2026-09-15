@@ -682,12 +682,18 @@ class MainWindow(QMainWindow):
                 self.editor.set_error_lines({int(m.group(1)): err_msg})
             return
 
-        error_lines = {}
-        for w in result.warnings:
-            m = re.search(r"Dòng\s+(\d+)", w)
-            if m:
-                error_lines[int(m.group(1))] = w
-        self.editor.set_error_lines(error_lines)
+        # TAM THOI AN hien thi canh bao (result.warnings - thieu F, thieu I/J...)
+        # tren editor: khong con to do/hien icon ⚠/tooltip cho cac dong nay
+        # nua. Logic parse+phat hien canh bao van chay binh thuong o duoi
+        # (result.warnings van co du lieu), chi la KHONG dua vao
+        # set_error_lines() nua. De bat lai: bo comment doan duoi va xoa
+        # dong set_error_lines({}) ngay ben duoi.
+        # error_lines = {}
+        # for w in result.warnings:
+        #     m = re.search(r"Dòng\s+(\d+)", w)
+        #     if m:
+        #         error_lines[int(m.group(1))] = w
+        self.editor.set_error_lines({})
 
         self.canvas.render_program(result)
         self.last_ref_point = (result.end_x, result.end_y)
@@ -981,14 +987,10 @@ class MainWindow(QMainWindow):
     def _insert_coordinate(self, x_mm: float, y_mm: float):
         """Chen toa do vao vi tri con tro hien tai trong editor."""
         nd = self.spin_decimals.value()
-        if not self._is_within_workpiece(x_mm, y_mm):
-            w_mm = self.spin_width.value()
-            h_mm = self.spin_height.value()
-            self.status.showMessage(
-                f"Đã bỏ qua: X{x_mm:.{nd}f} Y{y_mm:.{nd}f} nằm ngoài kích thước phôi "
-                f"({w_mm:g} × {h_mm:g} mm) — không chèn vào G-code."
-            )
-            return
+        # KHONG con chan chen toa do ngoai phoi nua - nguoi dung duoc tuy bien
+        # tu do click ra ngoai vung phoi da khai bao (vd de ve tham/mo rong
+        # thu, hoac phoi khai bao chua chinh xac). Xem _is_within_workpiece()
+        # neu can bat lai kiem tra nay sau.
         if self.absolute_mode:
             snippet = f"X{x_mm:.{nd}f} Y{y_mm:.{nd}f}"
         else:
@@ -1324,8 +1326,8 @@ class MainWindow(QMainWindow):
         """Luu chuong trinh G-code ra file, tra ve True neu luu THANH CONG
         (de closeEvent biet co the thoat duoc khong), False neu nguoi dung
         huy hop thoai hoac gap loi."""
-        if not self._confirm_save_warnings():
-            return False
+        # KHONG con hoi canh bao truoc khi luu nua (diem ngoai phoi/trung lap)
+        # - luu thang, xem _confirm_save_warnings() neu can bat lai sau.
         start_path = self._current_file_path or os.path.join(os.path.expanduser("~"), "program.txt")
         path, _ = QFileDialog.getSaveFileName(
             self, "Lưu chương trình G-code", start_path, "Text files (*.txt);;All files (*)")
