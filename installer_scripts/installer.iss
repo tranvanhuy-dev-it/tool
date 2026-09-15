@@ -221,8 +221,9 @@ begin
         { Luu lai token (ma + machineId) VAO THU MUC CAI DAT - ung dung
           GCode Vision se doc file nay moi lan khoi dong de tu xac minh lai
           voi server, dam bao dang chay DUNG TREN MAY da kich hoat. Thu muc
-          {app} co the CHUA TON TAI o thoi diem nay (truoc khi cac buoc cai
-          dat file chinh chay), nen phai tu tao truoc khi ghi file. }
+          cai dat (constant app) co the CHUA TON TAI o thoi diem nay (truoc
+          khi cac buoc cai dat file chinh chay), nen phai tu tao truoc khi
+          ghi file. }
         ForceDirectories(ExpandConstant('{app}'));
         SaveStringToFile(ExpandConstant('{app}\' + LICENSE_TOKEN_FILENAME),
           Code + #13#10 + MachineId, False);
