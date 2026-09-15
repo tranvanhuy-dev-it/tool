@@ -4,20 +4,24 @@ GOI (.exe qua PyInstaller), KHONG ap dung khi chay truc tiep tu source code
 (python3 run.py luc dev/test) - phat hien qua sys.frozen (PyInstaller tu
 dat thuoc tinh nay, source code thuong khong co).
 
-Co che: installer.iss (buoc cai dat) da luu san 1 file "license.token"
-(chua ma license + Machine GUID cua Windows) CANH file .exe sau khi xac
-minh + kich hoat thanh cong voi server. App chi can DOC LAI file do, tinh
-lai Machine GUID HIEN TAI, roi hoi server (qua /api/check) xem may nay co
-DUNG LA may da duoc kich hoat hay khong - neu file .exe bi COPY sang may
-khac (Machine GUID khac), server se tu choi va app dong lai.
+Co che: installer.iss (buoc cai dat) da GOI SERVER 1 LAN DUY NHAT luc cai
+dat (qua /api/verify) de xac minh ma + gan voi Machine GUID cua may, roi
+luu ca 2 vao file "license.token" CANH file .exe. Sau do, MOI LAN APP
+KHOI DONG chi SO SANH CUC BO: doc lai Machine GUID da luu trong token, so
+voi Machine GUID HIEN TAI cua may - KHONG goi lai server nua (nhanh hon,
+khong phu thuoc mang luc mo app). Neu file .exe (kem token) bi COPY sang
+may khac, Machine GUID se khac va app tu choi chay.
 
-Khong dung AI/ML - chi la 1 request HTTP don gian va so sanh chuoi.
+Danh doi da chap nhan: neu ai do biet duoc Machine GUID that cua 1 may da
+kich hoat va TU SUA file token tren may khac de khop, ho co the vuot qua
+kiem tra nay (khong con server nao doi chieu lai) - chap nhan rui ro nay
+o muc do thap de doi lay UX nhanh/khong can mang luc mo app.
+
+Khong dung AI/ML - chi la so sanh chuoi doc tu file va registry.
 """
 
 import os
 import sys
-import urllib.request
-import json
 
 # winreg CHI co tren Windows - import co dieu kien de module nay VAN import
 # duoc binh thuong tren Linux/macOS luc dev (dung sys.frozen de biet co can
@@ -27,9 +31,7 @@ try:
 except ImportError:
     winreg = None
 
-CHECK_API_URL = "https://gcode-license.tranvanhuy.io.vn/api/check"
 TOKEN_FILENAME = "license.token"
-_REQUEST_TIMEOUT_SEC = 10
 
 
 def is_frozen_build() -> bool:
@@ -80,7 +82,9 @@ def _read_token_file() -> tuple:
 def verify_license_or_exit():
     """Kiem tra license neu dang chay ban DA DONG GOI - neu khong hop le,
     hien thong bao loi va THOAT UNG DUNG NGAY (khong cho vao giao dien
-    chinh). Khong lam gi ca (return ngay) neu dang chay tu source code."""
+    chinh). Khong lam gi ca (return ngay) neu dang chay tu source code.
+    CHI SO SANH CUC BO (token da luu vs Machine GUID hien tai), KHONG goi
+    server - xem docstring dau file ve danh doi da chap nhan."""
     if not is_frozen_build():
         return
 
@@ -98,34 +102,6 @@ def verify_license_or_exit():
             "Ứng dụng này đã được cài đặt trên một máy khác.\n"
             "Vui lòng cài đặt lại bằng bộ cài đặt chính thức trên máy này."
         )
-        return
-
-    ok = _call_check_api(current_machine_id)
-    if not ok:
-        _show_error_and_exit(
-            "Không thể xác minh bản quyền cho máy này.\n"
-            "Vui lòng kiểm tra kết nối mạng, hoặc cài đặt lại ứng dụng bằng bộ cài đặt chính thức."
-        )
-
-
-def _call_check_api(machine_id: str) -> bool:
-    """Goi API /api/check - tra ve True neu server xac nhan machine_id nay
-    DA duoc kich hoat hop le. Loi ket noi (mat mang tam thoi) duoc coi la
-    THAT BAI (an toan hon la mac dinh cho qua) - nguoi dung co the thu lai
-    khi co mang."""
-    try:
-        body = json.dumps({"machineId": machine_id}).encode("utf-8")
-        req = urllib.request.Request(
-            CHECK_API_URL,
-            data=body,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=_REQUEST_TIMEOUT_SEC) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            return bool(data.get("ok"))
-    except Exception:
-        return False
 
 
 def _show_error_and_exit(message: str):
