@@ -46,6 +46,7 @@ class CanvasWidget(QGraphicsView):
         self.setResizeAnchor(QGraphicsView.AnchorViewCenter)
 
         self._last_click_mm = None   # diem click gan nhat, dung cho toa do tuong doi
+        self._known_points_mm: list[tuple[float, float]] = []  # cac diem X/Y (mm THAT) da co trong G-code, de snap vao
         self._origin_px = QPointF(MARGIN_PX, 0)  # cap nhat khi resize/draw
         self._segments: list[Segment] = []
         self._has_fitted_once = False  # chi tu dong fitInView() o lan render dau tien
@@ -67,6 +68,8 @@ class CanvasWidget(QGraphicsView):
         self._pen_hover_line = QPen(QColor(self._colors["hover"]), 1.2, Qt.DashLine)
         self._last_grid_bounds = (0.0, 0.0, 0.0, 0.0)  # min_x,max_x,min_y,max_y cua luoi hien tai
         self._guide_line_item = None  # duong ke tam thoi khi keo vach chia tren thuoc do
+        self._measure_line_item = None  # doan thang tam thoi cua cong cu do khoang cach
+        self._measure_dot_items: list = []
 
         # --- anh nen (ban ve tham chieu, da duoc crop khop khung phoi) ---
         # Quy uoc: goc DUOI-TRAI cua anh (pixel (0, image_height)) la moc tham chieu.
@@ -331,9 +334,12 @@ class CanvasWidget(QGraphicsView):
         self._bg_pixmap_item = None  # da bi xoa boi scene.clear()
         self._hover_marker_items = []
         self._guide_line_item = None
+        self._measure_line_item = None
+        self._measure_dot_items = []
         self.scene.clear()
         self._redraw_background()
         self._segments = result.segments
+        self._known_points_mm = self._collect_known_points(result.segments)
 
         # Khi chua co doan G-code nao (vd vua mo ung dung, editor con trong), hien thi
         # san mot he truc toa do co kich thuoc mac dinh de nguoi dung de hinh dung,
@@ -402,6 +408,23 @@ class CanvasWidget(QGraphicsView):
             self.fit_view()
             self._has_fitted_once = True
 
+    @staticmethod
+    def _collect_known_points(segments) -> list:
+        """Gom danh sach cac diem X/Y (mm THAT, tuyet doi) DA XUAT HIEN trong
+        chuong trinh G-code hien tai (diem dau + diem cuoi cua moi doan), khu
+        trung lap - dung de SNAP vao khi nguoi dung ho ren/click gan 1 diem
+        DA CO SAN, giup noi lien mach chinh xac tuyet doi (khac snap luoi, la
+        snap theo buoc luoi co dinh chu khong phai theo diem thuc te)."""
+        seen = set()
+        points = []
+        for seg in segments:
+            for x, y in ((seg.x0, seg.y0), (seg.x1, seg.y1)):
+                key = (round(x, 6), round(y, 6))
+                if key not in seen:
+                    seen.add(key)
+                    points.append((x, y))
+        return points
+
     def _line_coords(self, x0, y0, x1, y1):
         p0 = self.mm_to_scene(x0, y0)
         p1 = self.mm_to_scene(x1, y1)
@@ -417,20 +440,37 @@ class CanvasWidget(QGraphicsView):
     def set_grid_step(self, step_mm: float):
         self._grid_step_mm = max(0.001, step_mm)
 
+    _MAX_GRID_LINES = 2000  # tran an toan moi truc, tranh treo UI neu buoc luoi qua nho so voi vung ve
+
     def _draw_grid(self, min_x, max_x, min_y, max_y, step=None):
         import math
         if step is None:
             step = self._grid_step_mm
-        gx0 = math.floor(min_x / step) * step
-        gy0 = math.floor(min_y / step) * step
+        if step <= 0:
+            return
+        # Neu buoc luoi qua nho so voi kich thuoc vung ve (vd nguoi dung nhap
+        # 0.01mm cho phoi 10000mm), so duong luoi co the len toi hang trieu ->
+        # treo UI thread hoan toan (moi duong la 1 QGraphicsLineItem, khong co
+        # gioi han nao khac). Tang buoc thuc te len de khong vuot qua
+        # _MAX_GRID_LINES duong tren moi truc, van giu ty le boi cua step goc.
+        n_x = (max_x - min_x) / step
+        n_y = (max_y - min_y) / step
+        effective_step = step
+        n_max = max(n_x, n_y)
+        if n_max > self._MAX_GRID_LINES:
+            multiplier = math.ceil(n_max / self._MAX_GRID_LINES)
+            effective_step = step * multiplier
+
+        gx0 = math.floor(min_x / effective_step) * effective_step
+        gy0 = math.floor(min_y / effective_step) * effective_step
         x = gx0
         while x <= max_x:
             self.scene.addLine(*self._line_coords(x, min_y, x, max_y), self._pen_grid)
-            x += step
+            x += effective_step
         y = gy0
         while y <= max_y:
             self.scene.addLine(*self._line_coords(min_x, y, max_x, y), self._pen_grid)
-            y += step
+            y += effective_step
 
     def _draw_axes(self, min_x, max_x, min_y, max_y):
         self.scene.addLine(*self._line_coords(min_x, 0, max_x, 0), self._pen_axis)
@@ -460,6 +500,37 @@ class CanvasWidget(QGraphicsView):
             self.scene.removeItem(self._guide_line_item)
             self._guide_line_item = None
 
+    # ---------- cong cu do khoang cach tam thoi (khong chen vao G-code) ----------
+
+    def show_measure_line(self, x0_mm: float, y0_mm: float, x1_mm: float, y1_mm: float):
+        """Ve 1 doan thang tam thoi giua 2 diem (mm THAT) de nguoi dung xem
+        truoc khoang cach/goc - KHONG lien quan gi den G-code, chi la cong cu
+        do dac tham khao tren canvas. Goi lai voi diem moi se thay the doan cu."""
+        self.clear_measure_line()
+        pen = QPen(QColor("#f97316"), 1.6, Qt.DashLine)
+        p0 = self.real_mm_to_scene(x0_mm, y0_mm)
+        p1 = self.real_mm_to_scene(x1_mm, y1_mm)
+        line = self.scene.addLine(p0.x(), p0.y(), p1.x(), p1.y(), pen)
+        line.setZValue(70)
+        self._measure_line_item = line
+
+        r = self._marker_radius_px * 0.7
+        for pt in (p0, p1):
+            dot = self.scene.addEllipse(-r, -r, 2 * r, 2 * r, QPen(QColor("#f97316"), 1.6),
+                                         QBrush(QColor("#f97316")))
+            dot.setFlag(QGraphicsItem.ItemIgnoresTransformations, True)
+            dot.setPos(pt)
+            dot.setZValue(71)
+            self._measure_dot_items.append(dot)
+
+    def clear_measure_line(self):
+        if self._measure_line_item is not None:
+            self.scene.removeItem(self._measure_line_item)
+            self._measure_line_item = None
+        for item in self._measure_dot_items:
+            self.scene.removeItem(item)
+        self._measure_dot_items = []
+
     # ---------- tuong tac chuot ----------
     #
     # - Chuot trai (click don gian, khong keo): chon/chen toa do tai diem click.
@@ -477,10 +548,36 @@ class CanvasWidget(QGraphicsView):
     def set_marker_radius(self, radius_px: float):
         self._marker_radius_px = max(1.0, radius_px)
 
+    def _find_nearby_known_point(self, pos):
+        """Tim diem G-code DA CO SAN (tu _known_points_mm) gan con tro nhat,
+        trong ban kinh snap TREN MAN HINH - tra ve (x_mm, y_mm) THAT (piecewise)
+        cua diem do neu tim thay, None neu khong co diem nao du gan. Uu tien
+        HON snap luoi (goi truoc trong _mm_at_pos) vi noi lien 2 diem CHINH XAC
+        TUYET DOI quan trong hon la hut theo buoc luoi co dinh."""
+        if not self._snap_enabled or not self._known_points_mm:
+            return None
+        best = None
+        best_dist2 = self._snap_radius_px ** 2
+        for x_mm, y_mm in self._known_points_mm:
+            scene_pt = self.real_mm_to_scene(x_mm, y_mm)
+            screen_pt = self.mapFromScene(scene_pt)
+            dx = screen_pt.x() - pos.x()
+            dy = screen_pt.y() - pos.y()
+            dist2 = dx * dx + dy * dy
+            if dist2 <= best_dist2:
+                best_dist2 = dist2
+                best = (x_mm, y_mm)
+        return best
+
     def _mm_at_pos(self, pos) -> tuple[float, float]:
         """Toa do mm tai vi tri con tro man hinh, da hut vao giao diem luoi gan nhat
         neu khoang cach tren MAN HINH (px) nam trong ban kinh snap - giup click chinh xac
-        hon ma khong phu thuoc vao muc zoom hien tai."""
+        hon ma khong phu thuoc vao muc zoom hien tai. Uu tien snap vao 1 DIEM G-CODE
+        DA CO SAN (chinh xac tuyet doi) truoc khi thu snap theo LUOI (buoc co dinh)."""
+        known = self._find_nearby_known_point(pos)
+        if known is not None:
+            return known
+
         scene_pt = self.mapToScene(pos)
 
         if not self._snap_enabled or self._grid_step_mm <= 0:
@@ -521,12 +618,17 @@ class CanvasWidget(QGraphicsView):
     def mouseMoveEvent(self, event):
         x_mm, y_mm = self._mm_at_pos(event.pos())
         self.mouse_moved_mm.emit(x_mm, y_mm)
-        # Marker/crosshair phai ve theo he HIEN THI (display, tuc scene_to_mm/mm_to_scene
-        # ty le co dinh) de luon nam DUNG DUOI CON TRO man hinh - khong dung x_mm/y_mm
-        # (mm THAT sau hieu chinh piecewise) vi 2 he co the lech nhau, gay marker "nhay"
-        # sang mot vi tri khac noi ban vua click.
-        disp_x_mm, disp_y_mm = self.scene_to_mm(self.mapToScene(event.pos()))
-        self._update_hover_marker(event.pos(), disp_x_mm, disp_y_mm)
+
+        known = self._find_nearby_known_point(event.pos())
+        if known is not None:
+            self._update_hover_marker_at_known_point(known)
+        else:
+            # Marker/crosshair phai ve theo he HIEN THI (display, tuc scene_to_mm/mm_to_scene
+            # ty le co dinh) de luon nam DUNG DUOI CON TRO man hinh - khong dung x_mm/y_mm
+            # (mm THAT sau hieu chinh piecewise) vi 2 he co the lech nhau, gay marker "nhay"
+            # sang mot vi tri khac noi ban vua click.
+            disp_x_mm, disp_y_mm = self.scene_to_mm(self.mapToScene(event.pos()))
+            self._update_hover_marker(event.pos(), disp_x_mm, disp_y_mm)
 
         if event.buttons() & Qt.LeftButton and getattr(self, "_press_pos", None) is not None:
             if not getattr(self, "_is_dragging", False):
@@ -545,6 +647,28 @@ class CanvasWidget(QGraphicsView):
                 self._last_drag_pos = event.pos()
 
         super().mouseMoveEvent(event)
+
+    def _update_hover_marker_at_known_point(self, known_mm: tuple):
+        """Ve marker hover khi dang SNAP vao 1 DIEM G-CODE DA CO SAN (khac mau
+        voi marker snap luoi thong thuong, de nguoi dung phan biet duoc dang
+        noi vao 1 diem CHINH XAC TUYET DOI thay vi chi hut theo buoc luoi)."""
+        for item in self._hover_marker_items:
+            self.scene.removeItem(item)
+        self._hover_marker_items = []
+
+        x_mm, y_mm = known_mm
+        center = self.real_mm_to_scene(x_mm, y_mm)
+        known_color = QColor("#f97316")  # cam, khac voi mau hover luoi (#3b9eff)
+        r = self._marker_radius_px
+        marker = self.scene.addEllipse(
+            -r, -r, 2 * r, 2 * r,
+            QPen(known_color, 2.0),
+            QBrush(known_color.lighter(160)),
+        )
+        marker.setFlag(QGraphicsItem.ItemIgnoresTransformations, True)
+        marker.setPos(center)
+        marker.setZValue(50)
+        self._hover_marker_items.append(marker)
 
     def _update_hover_marker(self, pos, x_mm: float, y_mm: float):
         """Sang duong luoi gan con tro de de dinh vi:

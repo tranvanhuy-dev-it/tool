@@ -17,6 +17,7 @@ Luong hoat dong:
      quanh vi tri con tro. Diem giao luoi gan chuot duoc "hut" (snap) khi click.
 """
 
+import math
 import os
 import sys
 from PyQt5.QtWidgets import (
@@ -25,11 +26,14 @@ from PyQt5.QtWidgets import (
     QFileDialog, QStatusBar, QSplitter, QMessageBox, QSlider, QDoubleSpinBox,
     QSpinBox, QCheckBox, QColorDialog, QGridLayout
 )
-from PyQt5.QtGui import QFont, QSyntaxHighlighter, QTextCharFormat, QColor, QIcon
-from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QFont, QSyntaxHighlighter, QTextCharFormat, QColor, QIcon, QKeySequence
+from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtWidgets import QShortcut, QTableWidget, QTableWidgetItem, QAbstractItemView
 import re
+import datetime
+import shutil
 
-from gcode_vision.gcode_parser import parse_gcode
+from gcode_vision.gcode_parser import parse_gcode, convert_gcode_mode, estimate_machining_time_seconds
 from gcode_vision.canvas_widget import CanvasWidget
 from gcode_vision.gcode_editor import GcodeEditor
 from gcode_vision.ruler_dialog import RulerWidget, RULER_THICKNESS
@@ -75,12 +79,24 @@ class MainWindow(QMainWindow):
         self.ui_scale_pct = 100
         self._ruler_calib_x = None  # (pixel_positions, mm_positions) neu da hieu chuan thuoc chi tiet
         self._ruler_calib_y = None
+        self._measure_first_point = None  # diem dau tien da click cua cong cu do khoang cach tam thoi
+        self._render_debounce_timer = QTimer(self)
+        self._render_debounce_timer.setSingleShot(True)
+        self._render_debounce_timer.timeout.connect(self._render)
+
+        self._current_file_path = None  # duong dan file dang mo, None neu chua tung luu/mo
+        self._dirty = False  # co thay doi CHUA duoc luu ke tu lan luu/mo gan nhat
 
         self._build_ui()
         self._connect_signals()
         self._refresh_color_swatches()
         self.btn_dark_mode.setChecked(True)  # mac dinh mo che do toi
         self._render()
+
+        self._setup_autosave()
+        self._offer_restore_autosave()
+        self._setup_shortcuts()
+        self._update_window_title()
 
     # ---------------- UI ----------------
 
@@ -128,6 +144,8 @@ class MainWindow(QMainWindow):
         self.spin_marker_size.setValue(9)
         self.spin_marker_size.setMinimumWidth(55)
         l.addWidget(self.spin_marker_size)
+        self.chk_measure_mode = QCheckBox("Đo khoảng cách (không chèn G-code)")
+        l.addWidget(self.chk_measure_mode)
         self.chk_auto_n = QCheckBox("Tự đánh số N, bước:")
         self.chk_auto_n.setChecked(True)
         l.addWidget(self.chk_auto_n)
@@ -235,7 +253,25 @@ class MainWindow(QMainWindow):
         self.editor.setFont(QFont("Consolas", 11))
         self.editor.setPlaceholderText("G90\nG0 X0 Y0\nG1 X50 Y0\nG1 X50 Y30\n...")
         self.highlighter = GcodeHighlighter(self.editor.document())
-        left_layout.addWidget(self.editor)
+
+        left_splitter = QSplitter(Qt.Vertical)
+        left_splitter.addWidget(self.editor)
+
+        points_panel = QWidget()
+        points_layout = QVBoxLayout(points_panel)
+        points_layout.setContentsMargins(0, 0, 0, 0)
+        points_layout.addWidget(QLabel("Danh sách điểm X/Y trong chương trình"))
+        self.table_points = QTableWidget(0, 3)
+        self.table_points.setHorizontalHeaderLabels(["Dòng", "X (mm)", "Y (mm)"])
+        self.table_points.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table_points.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table_points.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table_points.verticalHeader().setVisible(False)
+        points_layout.addWidget(self.table_points)
+        left_splitter.addWidget(points_panel)
+        left_splitter.setSizes([600, 200])
+
+        left_layout.addWidget(left_splitter)
         splitter.addWidget(left)
 
         right = QWidget()
@@ -295,8 +331,11 @@ class MainWindow(QMainWindow):
         return container, inner
 
     def _connect_signals(self):
-        self.editor.textChanged.connect(self._render)
+        self.editor.textChanged.connect(self._schedule_render)
+        self.editor.textChanged.connect(self._mark_dirty)
         self.canvas.point_clicked.connect(self._on_canvas_clicked)
+        self.chk_measure_mode.toggled.connect(self._on_measure_mode_toggled)
+        self.table_points.itemSelectionChanged.connect(self._on_point_row_selected)
         self.canvas.undo_requested.connect(self._on_canvas_undo)
         self.canvas.mouse_moved_mm.connect(self._on_canvas_mouse_moved)
         self.chk_snap.toggled.connect(self.canvas.set_snap_enabled)
@@ -384,7 +423,44 @@ class MainWindow(QMainWindow):
             btn.updateGeometry()
 
     def _on_mode_toggled(self, checked):
-        self.absolute_mode = self.radio_abs.isChecked()
+        new_absolute = self.radio_abs.isChecked()
+        if new_absolute == self.absolute_mode:
+            return
+        old_text = self.editor.toPlainText()
+        nd = self.spin_decimals.value()
+        converted = convert_gcode_mode(old_text, to_absolute=new_absolute, decimals=nd)
+        converted = self._ensure_leading_mode_line(converted, new_absolute)
+        self.absolute_mode = new_absolute
+        self.editor.setPlainText(converted)
+        self.status.showMessage(
+            f"Đã chuyển sang chế độ {'tuyệt đối (G90)' if new_absolute else 'tương đối (G91)'} "
+            f"— toạ độ trong chương trình đã được tính lại tương ứng."
+        )
+
+    @staticmethod
+    def _ensure_leading_mode_line(text: str, absolute_mode: bool) -> str:
+        """Dam bao dong DAU TIEN (khong tinh dong trong/comment) cua text la
+        DUNG G90 hoac G91 tuong ung absolute_mode - thay the neu da co dong
+        G90/G91 o dau, hoac chen moi neu chua co."""
+        mode_line = "G90" if absolute_mode else "G91"
+        lines = text.splitlines()
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.upper() in ("G90", "G91"):
+                lines[i] = mode_line
+            else:
+                lines.insert(i, mode_line)
+            return "\n".join(lines) + "\n"
+        return mode_line + "\n"
+
+    def _schedule_render(self):
+        """Debounce viec render lai canvas: doi mot khoang ngan sau lan go phim
+        CUOI CUNG roi moi parse+ve lai, thay vi lam viec do dong bo NGAY moi
+        keystroke - voi chuong trinh G-code dai (hang nghin dong), render dong
+        bo moi phim se lam UI thread bi chan lien tuc, cam giac nhu "treo"."""
+        self._render_debounce_timer.start(150)
 
     def _render(self):
         text = self.editor.toPlainText()
@@ -396,10 +472,170 @@ class MainWindow(QMainWindow):
         self.canvas.render_program(result)
         self.last_ref_point = (result.end_x, result.end_y)
         nd = self.spin_decimals.value()
-        self.status.showMessage(
+        self._refresh_points_table(result.segments, nd)
+
+        time_str = self._format_machining_time(result.segments)
+        msg = (
             f"{len(result.segments)} đoạn di chuyển | Vị trí dao hiện tại: "
-            f"X{result.end_x:.{nd}f} Y{result.end_y:.{nd}f}"
+            f"X{result.end_x:.{nd}f} Y{result.end_y:.{nd}f} | Ước tính thời gian: {time_str}"
         )
+        if result.warnings:
+            msg += f"  ⚠ {result.warnings[0]}"
+        self.status.showMessage(msg)
+
+    def _refresh_points_table(self, segments, nd: int):
+        """Cap nhat bang danh sach diem: MOI dong ung voi 1 doan di chuyen
+        (segment) trong G-code, hien so dong nguon + toa do DICH (x1,y1) -
+        click vao 1 dong se dua con tro editor toi dong G-code tuong ung va
+        highlight diem do tren canvas, giup tra cuu/sua nhanh tung diem ma
+        khong phai doc thu cong toan bo van ban."""
+        self.table_points.blockSignals(True)
+        self.table_points.setRowCount(len(segments))
+        for row, seg in enumerate(segments):
+            item_line = QTableWidgetItem(str(seg.source_line))
+            item_x = QTableWidgetItem(f"{seg.x1:.{nd}f}")
+            item_y = QTableWidgetItem(f"{seg.y1:.{nd}f}")
+            for item in (item_line, item_x, item_y):
+                item.setData(Qt.UserRole, (seg.source_line, seg.x1, seg.y1))
+            self.table_points.setItem(row, 0, item_line)
+            self.table_points.setItem(row, 1, item_x)
+            self.table_points.setItem(row, 2, item_y)
+        self.table_points.blockSignals(False)
+
+    def _on_point_row_selected(self):
+        rows = self.table_points.selectionModel().selectedRows()
+        if not rows:
+            return
+        row = rows[0].row()
+        item = self.table_points.item(row, 0)
+        if item is None:
+            return
+        source_line, x_mm, y_mm = item.data(Qt.UserRole)
+
+        # dua con tro editor toi DUNG dong nguon cua diem nay
+        if source_line >= 1:
+            cursor = self.editor.textCursor()
+            block = self.editor.document().findBlockByNumber(source_line - 1)
+            if block.isValid():
+                cursor.setPosition(block.position())
+                cursor.movePosition(cursor.EndOfBlock, cursor.KeepAnchor)
+                self.editor.setTextCursor(cursor)
+                self.editor.setFocus()
+
+        # highlight diem tren canvas bang chinh co che do khoang cach (mot
+        # dau cham don, khong ve doan noi) - tai dung 1 diem thi khong can
+        # ve doan, chi can hien 1 marker de nguoi dung thay ro vi tri.
+        self.canvas.show_measure_line(x_mm, y_mm, x_mm, y_mm)
+
+    @staticmethod
+    def _format_machining_time(segments) -> str:
+        seconds = estimate_machining_time_seconds(segments)
+        if seconds < 60:
+            return f"{seconds:.0f} giây"
+        minutes = seconds / 60.0
+        if minutes < 60:
+            return f"{minutes:.1f} phút"
+        hours = minutes / 60.0
+        return f"{hours:.1f} giờ"
+
+    # ---------------- luu tru an toan (auto-save, khoi phuc, phim tat) ----------------
+
+    _AUTOSAVE_DIR = os.path.join(os.path.expanduser("~"), ".gcode_vision")
+    _AUTOSAVE_PATH = os.path.join(_AUTOSAVE_DIR, "autosave.txt")
+
+    def _mark_dirty(self):
+        self._dirty = True
+        self._update_window_title()
+
+    def _mark_clean(self):
+        self._dirty = False
+        self._update_window_title()
+
+    def _update_window_title(self):
+        name = os.path.basename(self._current_file_path) if self._current_file_path else "Chưa lưu"
+        star = " *" if self._dirty else ""
+        self.setWindowTitle(f"GCode Vision — {name}{star}")
+
+    def _setup_autosave(self):
+        """Tu dong luu 1 ban nhap (KHAC voi file that nguoi dung dang luu) moi
+        30 giay NEU co thay doi chua luu - de khoi phuc duoc neu app bi dong
+        dot ngot (crash, mat dien, lo tay tat may) ma chua kip Ctrl+S."""
+        try:
+            os.makedirs(self._AUTOSAVE_DIR, exist_ok=True)
+        except Exception:
+            return  # khong tao duoc thu muc (vd quyen truy cap) - bo qua auto-save, khong chan app
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.timeout.connect(self._do_autosave)
+        self._autosave_timer.start(30_000)
+
+    def _do_autosave(self):
+        if not self._dirty:
+            return
+        try:
+            with open(self._AUTOSAVE_PATH, "w", encoding="utf-8") as f:
+                f.write(self.editor.toPlainText())
+        except Exception:
+            pass  # auto-save la tien ich phu, khong lam gian doan cong viec neu loi
+
+    def _offer_restore_autosave(self):
+        """Luc khoi dong, neu phat hien file auto-save con ton tai (tu lan
+        chay truoc bi dong dot ngot), hoi nguoi dung co muon khoi phuc khong."""
+        if not os.path.exists(self._AUTOSAVE_PATH):
+            return
+        try:
+            with open(self._AUTOSAVE_PATH, "r", encoding="utf-8") as f:
+                content = f.read()
+        except Exception:
+            return
+        if not content.strip():
+            return
+        reply = QMessageBox.question(
+            self, "Khôi phục bản nháp",
+            "Phát hiện một bản nháp chưa lưu từ lần chạy trước (có thể do ứng dụng "
+            "bị đóng đột ngột). Bạn có muốn khôi phục lại nội dung đó không?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+        )
+        if reply == QMessageBox.Yes:
+            self.editor.setPlainText(content)
+            self.status.showMessage("Đã khôi phục bản nháp từ lần chạy trước.")
+        else:
+            try:
+                os.remove(self._AUTOSAVE_PATH)
+            except Exception:
+                pass
+
+    def _clear_autosave(self):
+        try:
+            if os.path.exists(self._AUTOSAVE_PATH):
+                os.remove(self._AUTOSAVE_PATH)
+        except Exception:
+            pass
+
+    def _setup_shortcuts(self):
+        """Phim tat chuan cho ung dung ky thuat: Ctrl+S luu, Ctrl+O mo,
+        Ctrl+N tao moi - nguoi dung quen voi cac phan mem CAD/editor khac se
+        dung duoc ngay khong can tim nut tren toolbar."""
+        QShortcut(QKeySequence.Save, self).activated.connect(self._save_file)
+        QShortcut(QKeySequence.Open, self).activated.connect(self._open_file)
+        QShortcut(QKeySequence.New, self).activated.connect(self._new_file)
+
+    def closeEvent(self, event):
+        if self._dirty:
+            reply = QMessageBox.question(
+                self, "Thoát ứng dụng",
+                "Nội dung hiện tại chưa được lưu. Bạn có muốn lưu trước khi thoát?",
+                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+                QMessageBox.Save,
+            )
+            if reply == QMessageBox.Cancel:
+                event.ignore()
+                return
+            if reply == QMessageBox.Save:
+                if not self._save_file():
+                    event.ignore()  # nguoi dung huy hop thoai luu -> khong thoat
+                    return
+        self._clear_autosave()
+        event.accept()
 
     # ---------------- anh ban ve tham chieu ----------------
     #
@@ -472,9 +708,64 @@ class MainWindow(QMainWindow):
         self._sync_rulers_to_canvas()
         self._render()
 
+    def _is_within_workpiece(self, x_mm: float, y_mm: float) -> bool:
+        """True neu (x_mm, y_mm) nam trong vung phoi da khai bao (goc (0,0) o
+        goc DUOI-TRAI, theo dung quy uoc he toa do cua toan bo ung dung)."""
+        w_mm = self.spin_width.value()
+        h_mm = self.spin_height.value()
+        eps = 1e-6
+        return -eps <= x_mm <= w_mm + eps and -eps <= y_mm <= h_mm + eps
+
+    def _on_measure_mode_toggled(self, checked: bool):
+        self._measure_first_point = None
+        self.canvas.clear_measure_line()
+        if checked:
+            self.status.showMessage("Chế độ đo khoảng cách: click 2 điểm liên tiếp trên bản vẽ.")
+
     def _on_canvas_clicked(self, x_mm: float, y_mm: float):
+        if self.chk_measure_mode.isChecked():
+            self._on_measure_click(x_mm, y_mm)
+            return
+        self._insert_coordinate(x_mm, y_mm)
+
+    def _on_measure_click(self, x_mm: float, y_mm: float):
+        """Cong cu do khoang cach/goc TAM THOI: click 2 diem lien tiep tren
+        canvas de xem khoang cach va goc giua chung, KHONG chen bat ky gi vao
+        G-code - chi de tham khao khi ve/can chinh. Click lan 3 se bat dau
+        1 phep do MOI (diem vua click tro thanh diem dau tien)."""
+        nd = self.spin_decimals.value()
+        if self._measure_first_point is None:
+            self._measure_first_point = (x_mm, y_mm)
+            self.canvas.clear_measure_line()
+            self.status.showMessage(
+                f"Đo khoảng cách: điểm đầu X{x_mm:.{nd}f} Y{y_mm:.{nd}f} — "
+                f"click điểm thứ hai để xem khoảng cách."
+            )
+            return
+
+        x0, y0 = self._measure_first_point
+        dx = x_mm - x0
+        dy = y_mm - y0
+        dist = (dx * dx + dy * dy) ** 0.5
+        angle_deg = math.degrees(math.atan2(dy, dx))
+        self.canvas.show_measure_line(x0, y0, x_mm, y_mm)
+        self.status.showMessage(
+            f"Khoảng cách: {dist:.{nd}f} mm   Góc: {angle_deg:.2f}°   "
+            f"(ΔX={dx:.{nd}f}  ΔY={dy:.{nd}f}) — click để đo đoạn mới."
+        )
+        self._measure_first_point = None  # san sang cho phep do tiep theo
+
+    def _insert_coordinate(self, x_mm: float, y_mm: float):
         """Chen toa do vao vi tri con tro hien tai trong editor."""
         nd = self.spin_decimals.value()
+        if not self._is_within_workpiece(x_mm, y_mm):
+            w_mm = self.spin_width.value()
+            h_mm = self.spin_height.value()
+            self.status.showMessage(
+                f"Đã bỏ qua: X{x_mm:.{nd}f} Y{y_mm:.{nd}f} nằm ngoài kích thước phôi "
+                f"({w_mm:g} × {h_mm:g} mm) — không chèn vào G-code."
+            )
+            return
         if self.absolute_mode:
             snippet = f"X{x_mm:.{nd}f} Y{y_mm:.{nd}f}"
         else:
@@ -500,6 +791,11 @@ class MainWindow(QMainWindow):
         )
 
     def _on_canvas_undo(self):
+        if self.chk_measure_mode.isChecked():
+            self._measure_first_point = None
+            self.canvas.clear_measure_line()
+            self.status.showMessage("Đã huỷ phép đo đang chọn.")
+            return
         self.editor.undo()
         self.status.showMessage("Đã hoàn tác thao tác gần nhất.")
 
@@ -534,8 +830,11 @@ class MainWindow(QMainWindow):
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
             if reply != QMessageBox.Yes:
                 return
-        self.editor.setPlainText("G90\n")
+        mode_line = "G90" if self.absolute_mode else "G91"
+        self.editor.setPlainText(mode_line + "\n")
         self.last_ref_point = (0.0, 0.0)
+        self._current_file_path = None
+        self._mark_clean()
         self.status.showMessage("Đã tạo chương trình G-code mới.")
 
     def _open_file(self):
@@ -548,27 +847,149 @@ class MainWindow(QMainWindow):
         try:
             with open(path, "r", encoding="utf-8") as f:
                 self.editor.setPlainText(f.read())
+            self._current_file_path = path
+            self._mark_clean()
         except Exception as e:
             QMessageBox.warning(self, "Lỗi", f"Không thể mở file: {e}")
 
-    def _save_file(self):
-        start_path = os.path.join(os.path.expanduser("~"), "program.txt")
+    def _save_file(self) -> bool:
+        """Luu chuong trinh G-code ra file, tra ve True neu luu THANH CONG
+        (de closeEvent biet co the thoat duoc khong), False neu nguoi dung
+        huy hop thoai hoac gap loi."""
+        if not self._confirm_save_warnings():
+            return False
+        start_path = self._current_file_path or os.path.join(os.path.expanduser("~"), "program.txt")
         path, _ = QFileDialog.getSaveFileName(
             self, "Lưu chương trình G-code", start_path, "Text files (*.txt);;All files (*)")
         if not path:
-            return
+            return False
+        self._backup_previous_version(path)
         try:
             with open(path, "w", encoding="utf-8") as f:
-                f.write(self.editor.toPlainText())
+                f.write(self._build_export_text())
+            self._current_file_path = path
+            self._mark_clean()
             self.status.showMessage(f"Đã lưu: {path}")
+            return True
         except Exception as e:
             QMessageBox.warning(self, "Lỗi", f"Không thể lưu file: {e}")
+            return False
+
+    _VERSION_HISTORY_DIR_NAME = ".gcode_vision_history"
+
+    def _backup_previous_version(self, path: str):
+        """Truoc khi GHI DE 1 file DA TON TAI, sao chep ban CU sang thu muc
+        lich su phien ban (canh file goc, dat theo timestamp) - de nguoi dung
+        co the tim lai ban truoc do neu lo ghi de sai. Khong lam gi neu file
+        chua ton tai (lan luu dau tien) hoac khong the sao chep (vd quyen)."""
+        if not os.path.exists(path):
+            return
+        try:
+            folder = os.path.join(os.path.dirname(path), self._VERSION_HISTORY_DIR_NAME)
+            os.makedirs(folder, exist_ok=True)
+            base = os.path.basename(path)
+            stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_path = os.path.join(folder, f"{base}.{stamp}.bak")
+            shutil.copy2(path, backup_path)
+            self._prune_old_versions(folder, base)
+        except Exception:
+            pass  # sao luu la tien ich phu, khong duoc chan viec luu file chinh
+
+    _MAX_VERSIONS_PER_FILE = 20
+
+    def _prune_old_versions(self, folder: str, base_name: str):
+        """Chi giu lai toi da _MAX_VERSIONS_PER_FILE ban cu nhat cho MOI file
+        (theo ten goc), xoa cac ban cu hon de thu muc lich su khong phinh to
+        vo han qua thoi gian."""
+        try:
+            entries = [f for f in os.listdir(folder) if f.startswith(base_name + ".")]
+            entries.sort()  # timestamp dang YYYYMMDD_HHMMSS nen sort chuoi = sort thoi gian
+            excess = len(entries) - self._MAX_VERSIONS_PER_FILE
+            for f in entries[:max(0, excess)]:
+                os.remove(os.path.join(folder, f))
+        except Exception:
+            pass
+
+    def _build_export_text(self) -> str:
+        """Chen 1 khoi comment METADATA vao DAU noi dung xuat ra (ngay giu
+        nguyen G-code - dong comment ";..." khong lam sai chuong trinh khi
+        nap vao may CNC), ghi lai ngay gio xuat, kich thuoc phoi va offset -
+        giup tra cuu lai boi canh cua file sau nay ma khong can nho lai."""
+        nd = self.spin_decimals.value()
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        w_mm = self.spin_width.value()
+        h_mm = self.spin_height.value()
+        ax = self.spin_ax.value()
+        ay = self.spin_ay.value()
+        mode = "G90 (tuyệt đối)" if self.absolute_mode else "G91 (tương đối)"
+        header = (
+            f"; Xuất bởi GCode Vision lúc {now}\n"
+            f"; Kích thước phôi: {w_mm:g} x {h_mm:g} mm | Offset a(X,Y): {ax:g}, {ay:g}\n"
+            f"; Chế độ tọa độ: {mode} | Số thập phân: {nd}\n"
+        )
+        return header + self.editor.toPlainText()
+
+    def _confirm_save_warnings(self) -> bool:
+        """Kiem tra chuong trinh G-code truoc khi luu, canh bao neu co toa do
+        vuot ngoai kich thuoc phoi da khai bao hoac diem trung lap bat thuong
+        (2 lenh chuyen dong lien tiep toi CUNG 1 toa do, thuong la do go nham).
+        Tra ve True neu nguoi dung dong y luu tiep (hoac khong co canh bao
+        nao), False neu nguoi dung chon huy de quay lai sua truoc."""
+        try:
+            result = parse_gcode(self.editor.toPlainText())
+        except Exception:
+            return True  # loi parse da duoc bao o status bar khi go, khong chan luu o day
+
+        warnings = []
+        w_mm = self.spin_width.value()
+        h_mm = self.spin_height.value()
+        out_of_bounds = 0
+        for seg in result.segments:
+            for x, y in ((seg.x0, seg.y0), (seg.x1, seg.y1)):
+                if not self._is_within_workpiece(x, y):
+                    out_of_bounds += 1
+        if out_of_bounds:
+            warnings.append(
+                f"Có {out_of_bounds} điểm nằm ngoài kích thước phôi đã khai báo "
+                f"({w_mm:g} × {h_mm:g} mm)."
+            )
+
+        duplicate = 0
+        for seg in result.segments:
+            if abs(seg.x0 - seg.x1) < 1e-6 and abs(seg.y0 - seg.y1) < 1e-6:
+                duplicate += 1
+        if duplicate:
+            warnings.append(
+                f"Có {duplicate} lệnh di chuyển tới đúng vị trí hiện tại "
+                f"(không di chuyển) — có thể do gõ nhầm tọa độ."
+            )
+
+        if not warnings:
+            return True
+
+        text = "\n".join(f"• {w}" for w in warnings)
+        reply = QMessageBox.warning(
+            self, "Cảnh báo trước khi lưu",
+            f"Phát hiện một số điểm bất thường trong chương trình:\n\n{text}\n\n"
+            f"Vẫn muốn lưu file?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        return reply == QMessageBox.Yes
 
 
 def main():
     app = QApplication(sys.argv)
     win = MainWindow()
     win.showMaximized()
+    # Tren mot so window manager Linux (vd lop tuong thich X11 cua Wayland),
+    # trang thai Qt.WindowMaximized bi WM bo qua hoan toan du goi bao nhieu
+    # lan/luc nao - giai phap chac chan hon la TU set kich thuoc cua so bang
+    # dung kich thuoc man hinh hien tai (khong dua vao WM hieu dung "maximize"
+    # la gi nua). Van goi showMaximized() truoc (de co UI dung cua trang thai
+    # maximized - vd nut khoi phuc) roi ghi de bang geometry man hinh day du.
+    screen = app.primaryScreen()
+    if screen is not None:
+        win.setGeometry(screen.availableGeometry())
     sys.exit(app.exec_())
 
 
