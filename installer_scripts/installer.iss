@@ -63,6 +63,13 @@ const
 
 var
   LicensePage: TInputQueryWizardPage;
+  { Luu tam ma + machineId DA XAC MINH THANH CONG, de ghi ra file token SAU
+    (trong CurStepChanged, luc hang so thu muc cai dat da chac chan duoc
+    khoi tao) - KHONG the ghi file ngay trong NextButtonClick cua
+    LicensePage, vi trang do hien TRUOC trang chon thu muc cai dat
+    (wpSelectDir), nen hang so do CHUA co gia tri tai thoi diem do (gay loi
+    runtime "app constant chua duoc khoi tao" khi goi ExpandConstant). }
+  VerifiedLicenseCode, VerifiedMachineId: String;
 
 { Machine GUID cua Windows (HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid)
   - 1 chuoi duy nhat, on dinh, duoc Windows tu tao cho MOI LAN CAI DAT HE
@@ -218,18 +225,28 @@ begin
       end
       else
       begin
-        { Luu lai token (ma + machineId) VAO THU MUC CAI DAT - ung dung
-          GCode Vision se doc file nay moi lan khoi dong de tu xac minh lai
-          voi server, dam bao dang chay DUNG TREN MAY da kich hoat. Thu muc
-          cai dat (constant app) co the CHUA TON TAI o thoi diem nay (truoc
-          khi cac buoc cai dat file chinh chay), nen phai tu tao truoc khi
-          ghi file. }
-        ForceDirectories(ExpandConstant('{app}'));
-        SaveStringToFile(ExpandConstant('{app}\' + LICENSE_TOKEN_FILENAME),
-          Code + #13#10 + MachineId, False);
+        { CHUA the ghi file token ngay o day - hang so thu muc cai dat chua
+          duoc khoi tao (trang nay hien TRUOC trang chon thu muc cai dat).
+          Chi luu tam vao bien toan cuc, file thuc su duoc ghi sau trong
+          CurStepChanged (ssPostInstall), luc hang so do da chac chan hop le. }
+        VerifiedLicenseCode := Code;
+        VerifiedMachineId := MachineId;
       end;
     finally
       WizardForm.Cursor := crDefault;
     end;
+  end;
+end;
+
+{ Ghi file token THAT SU, chay sau khi cac file da duoc cai dat xong
+  (ssPostInstall) - luc nay hang so thu muc cai dat chac chan da duoc khoi
+  tao dung gia tri thu muc nguoi dung da chon. }
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if (CurStep = ssPostInstall) and (VerifiedLicenseCode <> '') then
+  begin
+    ForceDirectories(ExpandConstant('{app}'));
+    SaveStringToFile(ExpandConstant('{app}\' + LICENSE_TOKEN_FILENAME),
+      VerifiedLicenseCode + #13#10 + VerifiedMachineId, False);
   end;
 end;
