@@ -23,7 +23,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QPlainTextEdit, QLabel, QRadioButton, QButtonGroup, QPushButton,
     QFileDialog, QStatusBar, QSplitter, QMessageBox, QSlider, QDoubleSpinBox,
-    QSpinBox, QCheckBox, QColorDialog
+    QSpinBox, QCheckBox, QColorDialog, QGridLayout
 )
 from PyQt5.QtGui import QFont, QSyntaxHighlighter, QTextCharFormat, QColor, QIcon
 from PyQt5.QtCore import Qt
@@ -32,6 +32,7 @@ import re
 from gcode_parser import parse_gcode
 from canvas_widget import CanvasWidget
 from gcode_editor import GcodeEditor
+from ruler_dialog import RulerWidget, RULER_THICKNESS
 
 
 class GcodeHighlighter(QSyntaxHighlighter):
@@ -72,6 +73,8 @@ class MainWindow(QMainWindow):
         self.last_ref_point = (0.0, 0.0)  # diem tham chieu cho che do tuong doi
         self._base_app_font_pt = QApplication.font().pointSize()
         self.ui_scale_pct = 100
+        self._ruler_calib_x = None  # (pixel_positions, mm_positions) neu da hieu chuan thuoc chi tiet
+        self._ruler_calib_y = None
 
         self._build_ui()
         self._connect_signals()
@@ -113,7 +116,7 @@ class MainWindow(QMainWindow):
         l.addWidget(QLabel("Số thập phân:"))
         self.spin_decimals = QSpinBox()
         self.spin_decimals.setRange(0, 6)
-        self.spin_decimals.setValue(3)
+        self.spin_decimals.setValue(0)
         self.spin_decimals.setMinimumWidth(55)
         l.addWidget(self.spin_decimals)
         self.chk_snap = QCheckBox("Hút lưới")
@@ -194,7 +197,7 @@ class MainWindow(QMainWindow):
         self.spin_grid = QDoubleSpinBox()
         self.spin_grid.setRange(0.01, 10000)
         self.spin_grid.setDecimals(2)
-        self.spin_grid.setValue(5.0)
+        self.spin_grid.setValue(1.0)
         self.spin_grid.setMinimumWidth(75)
         l.addWidget(self.spin_grid)
         l.addWidget(QLabel("Độ mờ ảnh nền:"))
@@ -248,11 +251,30 @@ class MainWindow(QMainWindow):
         right_header.addStretch()
 
         right_layout.addLayout(right_header)
+
+        # Thuoc do THUONG TRUC (giong Word): luoi 2x2 quanh canvas - goc trong,
+        # thuoc X (ngang) o tren, thuoc Y (doc) o trai, canvas o giua. Luon
+        # hien san, khong can bam nut de bat/tat; dong bo qua view_changed.
+        canvas_grid = QWidget()
+        grid = QGridLayout(canvas_grid)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setSpacing(0)
+
         self.canvas = CanvasWidget()
-        right_layout.addWidget(self.canvas)
+        self.ruler_x = RulerWidget("x", self.canvas)
+        self.ruler_y = RulerWidget("y", self.canvas)
+        corner = QWidget()
+        corner.setFixedSize(RULER_THICKNESS, RULER_THICKNESS)
+
+        grid.addWidget(corner, 0, 0)
+        grid.addWidget(self.ruler_x, 0, 1)
+        grid.addWidget(self.ruler_y, 1, 0)
+        grid.addWidget(self.canvas, 1, 1)
+
+        right_layout.addWidget(canvas_grid)
         splitter.addWidget(right)
 
-        splitter.setSizes([600, 800])
+        splitter.setSizes([420, 980])
 
         self.status = QStatusBar()
         self.setStatusBar(self.status)
@@ -290,6 +312,8 @@ class MainWindow(QMainWindow):
         self.btn_undo.clicked.connect(self._on_canvas_undo)
 
         self.btn_load_image.clicked.connect(self._load_drawing_image)
+        self.ruler_x.calibration_changed.connect(self._on_ruler_calibration_changed)
+        self.ruler_y.calibration_changed.connect(self._on_ruler_calibration_changed)
         self.spin_width.valueChanged.connect(self._on_image_params_changed)
         self.spin_height.valueChanged.connect(self._on_image_params_changed)
         self.spin_ax.valueChanged.connect(self._on_image_params_changed)
@@ -406,15 +430,46 @@ class MainWindow(QMainWindow):
             self.spin_height.blockSignals(False)
 
         self._on_image_params_changed()
+        self._sync_rulers_to_canvas()
         self.status.showMessage(
             "Đã tải ảnh. Đã tự đặt Cao phôi theo đúng tỷ lệ khung hình. "
-            "Chỉnh lại Rộng/Cao phôi và giá trị a (X, Y) nếu cần cho khớp bản vẽ thật."
+            "Kéo vạch trên thước (trên/trái canvas) hoặc double-click để thêm vạch chia "
+            "nếu bản vẽ có vùng kích thước không đúng tỷ lệ đều."
         )
+
+    def _sync_rulers_to_canvas(self):
+        """Nap lai kich thuoc anh + calibration hien tai cua canvas vao 2
+        thuoc do thuong truc - goi moi khi anh/hieu chuan thay doi tu nguon
+        khac (tai anh moi, doi Rong/Cao phoi...) de thuoc luon dong bo."""
+        img_w = self.canvas._bg_image_w_px
+        img_h = self.canvas._bg_image_h_px
+        self.ruler_x.set_image_size(img_w, img_h)
+        self.ruler_y.set_image_size(img_w, img_h)
+        self.ruler_x.load_calibration(
+            self.canvas._calib_x.pixel_positions, self.canvas._calib_x.mm_positions)
+        self.ruler_y.load_calibration(
+            self.canvas._calib_y.pixel_positions, self.canvas._calib_y.mm_positions)
+
+    def _on_ruler_calibration_changed(self, axis: str, pixel_positions: list, mm_positions: list):
+        """Nguoi dung vua keo/nhap mm xong tren 1 thuoc - ap dung NGAY LAP TUC
+        vao canvas (khong can nut Ap dung rieng). Anh nen GIU NGUYEN kich thuoc
+        hien thi co dinh (khong co gian/meo theo tung lan sua mm - ty le trung
+        binh thay doi lien tuc se rat kho nhin); CHI toa do khi click duoc tinh
+        chinh xac theo tung doan calibration piecewise."""
+        self.canvas.set_axis_calibration(axis, pixel_positions, mm_positions)
+        if axis == "x":
+            self._ruler_calib_x = (pixel_positions, mm_positions)
+        else:
+            self._ruler_calib_y = (pixel_positions, mm_positions)
+        self._render()
+        n_segs = len(pixel_positions) - 1
+        self.status.showMessage(f"Đã cập nhật hiệu chỉnh thước đo trục {axis.upper()}: {n_segs} đoạn.")
 
     def _on_image_params_changed(self):
         self.canvas.set_workpiece_size(self.spin_width.value(), self.spin_height.value())
         self.canvas.set_offset_a(self.spin_ax.value(), self.spin_ay.value())
         self.canvas.set_grid_step(self.spin_grid.value())
+        self._sync_rulers_to_canvas()
         self._render()
 
     def _on_canvas_clicked(self, x_mm: float, y_mm: float):

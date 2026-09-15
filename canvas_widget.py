@@ -17,6 +17,7 @@ from PyQt5.QtGui import QPen, QColor, QBrush, QPainter, QFont, QPixmap
 from PyQt5.QtCore import Qt, QPointF, pyqtSignal, QRectF
 
 from gcode_parser import ParseResult, Segment, arc_to_polyline
+from ruler_calibration import AxisCalibration
 
 MM_TO_PX = 4.0          # ty le hien thi: 1 mm ban ve = 4 px man hinh
 MARGIN_PX = 40           # le trang de con hien thi truc va nhan toa do
@@ -29,6 +30,9 @@ class CanvasWidget(QGraphicsView):
     undo_requested = pyqtSignal()
     # phat tin hieu lien tuc khi di chuyen chuot tren canvas: toa do (mm), da snap luoi neu du gan
     mouse_moved_mm = pyqtSignal(float, float)
+    # phat tin hieu moi khi zoom/pan/resize thay doi (transform hoac scrollbar) - de
+    # cac widget thuoc do (RulerWidget) ben ngoai tu ve lai cho dong bo voi canvas.
+    view_changed = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -62,6 +66,7 @@ class CanvasWidget(QGraphicsView):
         self._is_dragging = False
         self._pen_hover_line = QPen(QColor(self._colors["hover"]), 1.2, Qt.DashLine)
         self._last_grid_bounds = (0.0, 0.0, 0.0, 0.0)  # min_x,max_x,min_y,max_y cua luoi hien tai
+        self._guide_line_item = None  # duong ke tam thoi khi keo vach chia tren thuoc do
 
         # --- anh nen (ban ve tham chieu, da duoc crop khop khung phoi) ---
         # Quy uoc: goc DUOI-TRAI cua anh (pixel (0, image_height)) la moc tham chieu.
@@ -76,6 +81,12 @@ class CanvasWidget(QGraphicsView):
         self._workpiece_w_mm = 100.0
         self._workpiece_h_mm = 100.0
         self._offset_a_mm = (0.0, 0.0)
+
+        # Hieu chuan ty le px/mm THEO TUNG DOAN (piecewise), rieng cho truc X va Y.
+        # Mac dinh (chua hieu chuan chi tiet) chi co 1 doan duy nhat, tuong duong
+        # dung Rong/Cao phoi nhu truoc - xem set_workpiece_size() va _sync_default_calibration().
+        self._calib_x = AxisCalibration()
+        self._calib_y = AxisCalibration()
         self._bg_opacity = 0.5
         self._grid_step_mm = 5.0
         self._snap_enabled = True
@@ -101,7 +112,14 @@ class CanvasWidget(QGraphicsView):
         self._bg_source_pixmap = pix
         self._bg_image_w_px = float(pix.width())
         self._bg_image_h_px = float(pix.height())
+        self._sync_default_calibration()
         self._redraw_background()
+        # Anh moi co the co kich thuoc rat khac voi khung nhin dang fit hien tai
+        # (vd luc khoi dong dang fit theo vung 200x200mm mac dinh) - danh dau
+        # can fit lai NGAY LAN render tiep theo, tranh anh hien qua nho/lon sai
+        # ty le so voi khung nhin (chinh la nguyen nhan gay cam giac "thuoc bi lech").
+        self._has_fitted_once = False
+        self._user_has_zoomed = False
 
     def set_background_opacity(self, value: float):
         self._bg_opacity = max(0.0, min(1.0, value))
@@ -110,9 +128,12 @@ class CanvasWidget(QGraphicsView):
 
     def set_workpiece_size(self, width_mm: float, height_mm: float):
         """Kich thuoc THUC TE (mm) cua phoi, tuong ung voi toan bo chieu rong/cao
-        cua anh da crop. Dung de tinh ty le px/mm rieng cho truc X va truc Y."""
+        cua anh da crop. Dung lam ty le mac dinh (1 doan don gian) cho ca truc X,
+        Y - bi ghi de neu nguoi dung da hieu chuan chi tiet bang thuoc do (xem
+        set_axis_calibration)."""
         self._workpiece_w_mm = max(1e-6, width_mm)
         self._workpiece_h_mm = max(1e-6, height_mm)
+        self._sync_default_calibration()
         self._redraw_background()
 
     def set_offset_a(self, a_x_mm: float, a_y_mm: float):
@@ -121,15 +142,63 @@ class CanvasWidget(QGraphicsView):
         self._offset_a_mm = (a_x_mm, a_y_mm)
         self._redraw_background()
 
+    def _sync_default_calibration(self):
+        """Cap nhat lai calibration mac dinh (1 doan) tu Rong/Cao phoi - CHI khi
+        nguoi dung CHUA tu hieu chuan chi tiet bang thuoc do (is_default() == True),
+        de khong ghi de mat cong suc hieu chuan da lam."""
+        if self._calib_x.is_default():
+            self._calib_x.set_from_total(self._bg_image_w_px, self._workpiece_w_mm)
+        if self._calib_y.is_default():
+            self._calib_y.set_from_total(self._bg_image_h_px, self._workpiece_h_mm)
+
+    def set_axis_calibration(self, axis: str, pixel_positions: list, mm_positions: list):
+        """Thiet lap hieu chuan CHI TIET (nhieu doan) cho 1 truc, tu ket qua
+        nguoi dung keo tren thuoc do overlay. axis: 'x' hoac 'y'."""
+        calib = self._calib_x if axis == "x" else self._calib_y
+        calib.set_breakpoints(pixel_positions, mm_positions)
+        self._redraw_background()
+
+    def reset_axis_calibration(self, axis: str = None):
+        """Xoa hieu chuan chi tiet, quay ve dung 1 ty le don gian tu Rong/Cao phoi.
+        axis=None: reset ca 2 truc."""
+        if axis in (None, "x"):
+            self._calib_x = AxisCalibration()
+        if axis in (None, "y"):
+            self._calib_y = AxisCalibration()
+        self._sync_default_calibration()
+        self._redraw_background()
+
     def _px_per_mm_xy(self) -> tuple[float, float]:
-        return (self._bg_image_w_px / self._workpiece_w_mm,
-                self._bg_image_h_px / self._workpiece_h_mm)
+        """Ty le hien thi CO DINH, dung DUNG Rong/Cao phoi nguoi dung nhap (KHONG
+        phu thuoc calibration piecewise chi tiet) - de anh nen LUON hien thi
+        dung 1 kich thuoc co dinh, khong bi co gian/meo moi khi nguoi dung sua
+        mm cho 1 doan tren thuoc do. Tinh toa do click van dung image_px_to_mm()
+        voi calibration piecewise chinh xac, chi rieng phan VE anh la co dinh."""
+        sx = self._bg_image_w_px / max(1e-9, self._workpiece_w_mm)
+        sy = self._bg_image_h_px / max(1e-9, self._workpiece_h_mm)
+        return sx, sy
 
     def image_px_to_mm(self, ix: float, iy: float) -> tuple[float, float]:
         """Quy doi toa do pixel trong ANH GOC (0,0 tren-trai, Y huong xuong) sang
-        toa do gia cong that (mm), da cong offset a."""
-        sx, sy = self._px_per_mm_xy()
+        toa do gia cong THAT (mm), da cong offset a. Dung hieu chuan PIECEWISE
+        (chinh xac theo tung doan da hieu chuan) neu nguoi dung da thiet lap,
+        khong chi 1 ty le tuyen tinh don gian cho ca truc. DUNG DE: xuat toa do
+        khi click chon diem (gia tri G-code thuc te)."""
         ax, ay = self._offset_a_mm
+        x_mm = self._calib_x.pixel_to_mm(ix) + ax
+        y_mm = self._calib_y.pixel_to_mm(self._bg_image_h_px - iy) + ay
+        return x_mm, y_mm
+
+    def image_px_to_display_mm(self, ix: float, iy: float) -> tuple[float, float]:
+        """Quy doi pixel ANH GOC sang mm theo TY LE HIEN THI CO DINH (Rong/Cao
+        phoi, KHONG dung calibration piecewise) - dung DE VE (vi tri vach chia
+        tren thuoc do, vi tri anh nen tren canvas). Vi tri VE tren man hinh vi
+        vay LUON CO DINH theo dung pixel ban da dat/keo, KHONG tu dich chuyen
+        moi khi ban sua gia tri mm cua bat ky doan nao khac tren thuoc - chi mm
+        HIEN THI (nhan so) thay doi, con VI TRI VE thi khong doi tru khi ban
+        chu dong keo lai vach do."""
+        ax, ay = self._offset_a_mm
+        sx, sy = self._px_per_mm_xy()
         x_mm = ix / sx + ax
         y_mm = (self._bg_image_h_px - iy) / sy + ay
         return x_mm, y_mm
@@ -162,6 +231,36 @@ class CanvasWidget(QGraphicsView):
 
     def scene_to_mm(self, pt: QPointF) -> tuple[float, float]:
         return (pt.x() / MM_TO_PX, -pt.y() / MM_TO_PX)
+
+    def real_mm_to_scene(self, x_mm: float, y_mm: float) -> QPointF:
+        """Chieu NGUOC LAI cua scene_to_real_mm(): tu mm THAT (piecewise, vd so
+        X/Y ghi trong G-code) ra diem scene DE VE - di qua pixel ANH GOC de
+        diem/duong ve TRUNG KHOP DUNG VI TRI PIXEL tren anh nen (khong bi lech
+        do anh co vung ty le khong deu), thay vi mm_to_scene() (chia deu, chi
+        dung khi CHUA co anh nen/calibration)."""
+        if self._bg_image_path is None:
+            return self.mm_to_scene(x_mm, y_mm)
+        ax, ay = self._offset_a_mm
+        ix = self._calib_x.mm_to_pixel(x_mm - ax)
+        iy_from_bottom = self._calib_y.mm_to_pixel(y_mm - ay)
+        iy = self._bg_image_h_px - iy_from_bottom
+        disp_x_mm, disp_y_mm = self.image_px_to_display_mm(ix, iy)
+        return self.mm_to_scene(disp_x_mm, disp_y_mm)
+
+    def scene_to_real_mm(self, pt: QPointF) -> tuple[float, float]:
+        """Quy doi 1 diem scene (vi tri click/hover thuc te tren canvas) sang
+        toa do gia cong THAT (mm), di qua calibration PIECEWISE neu da co anh
+        nen - thay vi chi dung ty le hien thi co dinh (scene_to_mm). Neu chua
+        co anh nen thi khong co gi de hieu chuan, tra ve nhu scene_to_mm."""
+        if self._bg_image_path is None:
+            return self.scene_to_mm(pt)
+        display_x_mm, display_y_mm = self.scene_to_mm(pt)
+        ax, ay = self._offset_a_mm
+        sx, sy = self._px_per_mm_xy()
+        # dao nguoc image_px_to_display_mm(): tu display mm ra pixel anh goc
+        ix = (display_x_mm - ax) * sx
+        iy = self._bg_image_h_px - (display_y_mm - ay) * sy
+        return self.image_px_to_mm(ix, iy)
 
     # ---------- mau sac ----------
 
@@ -217,12 +316,21 @@ class CanvasWidget(QGraphicsView):
         super().resizeEvent(event)
         if not getattr(self, '_user_has_zoomed', False) and getattr(self, '_has_fitted_once', False):
             self.fit_view()
+        self.view_changed.emit()
+
+    def scrollContentsBy(self, dx, dy):
+        """Override de bat MOI thay doi cuon (bao gom ca do fitInView()/scale()
+        gay ra ben trong Qt, khong chi thao tac keo thu cong) - noi tap trung
+        duy nhat de phat view_changed, dam bao thuoc do luon dong bo voi canvas."""
+        super().scrollContentsBy(dx, dy)
+        self.view_changed.emit()
 
     def render_program(self, result: ParseResult, sheet_w: float = None, sheet_h: float = None):
         # luu lai transform (zoom/pan) hien tai truoc khi xoa scene, vi scene.clear()
         # khong lam mat transform cua view, nhung ta van can fitInView co kiem soat
         self._bg_pixmap_item = None  # da bi xoa boi scene.clear()
         self._hover_marker_items = []
+        self._guide_line_item = None
         self.scene.clear()
         self._redraw_background()
         self._segments = result.segments
@@ -272,15 +380,14 @@ class CanvasWidget(QGraphicsView):
         for seg in result.segments:
             pen = self._pen_rapid if seg.rapid else self._pen_cut
             if seg.kind == "line":
-                self.scene.addLine(
-                    *self._line_coords(seg.x0, seg.y0, seg.x1, seg.y1), pen)
+                self.scene.addLine(*self._gcode_line_coords(seg.x0, seg.y0, seg.x1, seg.y1), pen)
             else:
                 pts = arc_to_polyline(seg)
                 for (ax, ay), (bx, by) in zip(pts, pts[1:]):
-                    self.scene.addLine(*self._line_coords(ax, ay, bx, by), pen)
+                    self.scene.addLine(*self._gcode_line_coords(ax, ay, bx, by), pen)
 
         # danh dau diem cuoi (vi tri dao hien tai)
-        p = self.mm_to_scene(result.end_x, result.end_y)
+        p = self.real_mm_to_scene(result.end_x, result.end_y)
         r = 4
         self.scene.addEllipse(p.x() - r, p.y() - r, 2 * r, 2 * r,
                                QPen(QColor("#16a34a"), 1.5))
@@ -298,6 +405,13 @@ class CanvasWidget(QGraphicsView):
     def _line_coords(self, x0, y0, x1, y1):
         p0 = self.mm_to_scene(x0, y0)
         p1 = self.mm_to_scene(x1, y1)
+        return p0.x(), p0.y(), p1.x(), p1.y()
+
+    def _gcode_line_coords(self, x0, y0, x1, y1):
+        """Nhu _line_coords nhung dung real_mm_to_scene() - danh rieng cho duong
+        chay dao ve tu G-code, de trung khop dung pixel anh nen theo calibration."""
+        p0 = self.real_mm_to_scene(x0, y0)
+        p1 = self.real_mm_to_scene(x1, y1)
         return p0.x(), p0.y(), p1.x(), p1.y()
 
     def set_grid_step(self, step_mm: float):
@@ -322,6 +436,30 @@ class CanvasWidget(QGraphicsView):
         self.scene.addLine(*self._line_coords(min_x, 0, max_x, 0), self._pen_axis)
         self.scene.addLine(*self._line_coords(0, min_y, 0, max_y), self._pen_axis)
 
+    # ---------- duong ke huong dan (guide line) khi keo vach chia thuoc do ----------
+
+    def show_guide_line(self, axis: str, mm_pos: float):
+        """Ve 1 duong ke tam thoi XUYEN SUOT ban ve, tai vi tri mm_pos tren
+        truc axis ('x': duong doc tai X=mm_pos, 'y': duong ngang tai Y=mm_pos)
+        - dung khi nguoi dung dang KEO 1 vach chia tren thuoc do, giup can
+        chinh chinh xac theo cac chi tiet trong anh nen."""
+        if self._guide_line_item is not None:
+            self.scene.removeItem(self._guide_line_item)
+            self._guide_line_item = None
+        min_x, max_x, min_y, max_y = self._last_grid_bounds
+        pen = QPen(QColor(self._colors["hover"]), 1.0, Qt.DashLine)
+        if axis == "x":
+            line = self.scene.addLine(*self._line_coords(mm_pos, min_y, mm_pos, max_y), pen)
+        else:
+            line = self.scene.addLine(*self._line_coords(min_x, mm_pos, max_x, mm_pos), pen)
+        line.setZValue(60)
+        self._guide_line_item = line
+
+    def clear_guide_line(self):
+        if self._guide_line_item is not None:
+            self.scene.removeItem(self._guide_line_item)
+            self._guide_line_item = None
+
     # ---------- tuong tac chuot ----------
     #
     # - Chuot trai (click don gian, khong keo): chon/chen toa do tai diem click.
@@ -344,11 +482,15 @@ class CanvasWidget(QGraphicsView):
         neu khoang cach tren MAN HINH (px) nam trong ban kinh snap - giup click chinh xac
         hon ma khong phu thuoc vao muc zoom hien tai."""
         scene_pt = self.mapToScene(pos)
-        x_mm, y_mm = self.scene_to_mm(scene_pt)
 
         if not self._snap_enabled or self._grid_step_mm <= 0:
-            return x_mm, y_mm
+            return self.scene_to_real_mm(scene_pt)
 
+        # Luoi (grid) duoc ve theo he toa do HIEN THI co dinh (mm_to_scene/scene_to_mm),
+        # nen viec snap cung phai tinh tren he do de dung vi tri giao diem luoi tren
+        # man hinh; chi sau khi xac dinh duoc DIEM SCENE cuoi cung moi quy doi sang
+        # mm THAT (piecewise) de tra ve.
+        x_mm, y_mm = self.scene_to_mm(scene_pt)
         step = self._grid_step_mm
         gx_mm = round(x_mm / step) * step
         gy_mm = round(y_mm / step) * step
@@ -358,8 +500,8 @@ class CanvasWidget(QGraphicsView):
         dx_px = grid_screen.x() - pos.x()
         dy_px = grid_screen.y() - pos.y()
         if (dx_px * dx_px + dy_px * dy_px) ** 0.5 <= self._snap_radius_px:
-            return gx_mm, gy_mm
-        return x_mm, y_mm
+            return self.scene_to_real_mm(grid_scene)
+        return self.scene_to_real_mm(scene_pt)
 
     # Nguong (pixel) de phan biet "click chon diem" voi "giu va keo de di chuyen":
     # neu chuot di chuyen qua nguong nay trong luc dang giu nut trai, coi la keo (pan),
@@ -379,7 +521,12 @@ class CanvasWidget(QGraphicsView):
     def mouseMoveEvent(self, event):
         x_mm, y_mm = self._mm_at_pos(event.pos())
         self.mouse_moved_mm.emit(x_mm, y_mm)
-        self._update_hover_marker(event.pos(), x_mm, y_mm)
+        # Marker/crosshair phai ve theo he HIEN THI (display, tuc scene_to_mm/mm_to_scene
+        # ty le co dinh) de luon nam DUNG DUOI CON TRO man hinh - khong dung x_mm/y_mm
+        # (mm THAT sau hieu chinh piecewise) vi 2 he co the lech nhau, gay marker "nhay"
+        # sang mot vi tri khac noi ban vua click.
+        disp_x_mm, disp_y_mm = self.scene_to_mm(self.mapToScene(event.pos()))
+        self._update_hover_marker(event.pos(), disp_x_mm, disp_y_mm)
 
         if event.buttons() & Qt.LeftButton and getattr(self, "_press_pos", None) is not None:
             if not getattr(self, "_is_dragging", False):
@@ -482,6 +629,7 @@ class CanvasWidget(QGraphicsView):
         self._user_has_zoomed = True
         factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
         self.scale(factor, factor)
+        self.view_changed.emit()
 
     @property
     def last_click_mm(self):
