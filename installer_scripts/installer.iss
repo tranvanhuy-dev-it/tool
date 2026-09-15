@@ -55,9 +55,28 @@ Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChang
   LICENSE_API_URL neu doi domain/API endpoint sau nay. }
 const
   LICENSE_API_URL = 'https://gcode-license.tranvanhuy.io.vn/api/verify';
+  { Ten file token luu LAI TREN MAY sau khi kich hoat thanh cong - ung dung
+    GCode Vision (Python) se doc file nay MOI LAN KHOI DONG de tu xac minh
+    lai voi server (qua /api/check), dam bao file .exe dang chay DUNG TREN
+    MAY da duoc kich hoat hop le, khong phai bi copy tu may khac. }
+  LICENSE_TOKEN_FILENAME = 'license.token';
 
 var
   LicensePage: TInputQueryWizardPage;
+
+{ Machine GUID cua Windows (HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid)
+  - 1 chuoi duy nhat, on dinh, duoc Windows tu tao cho MOI LAN CAI DAT HE
+  DIEU HANH (khong doi khi restart/cap nhat may, nhung SE KHAC neu cai lai
+  Windows hoac dung tren may khac) - dung lam "dau van tay may" don gian,
+  khong can tinh toan phuc tap tu phan cung. }
+function GetMachineId(): String;
+var
+  Guid: String;
+begin
+  if not RegQueryStringValue(HKLM, 'SOFTWARE\Microsoft\Cryptography', 'MachineGuid', Guid) then
+    Guid := '';
+  Result := Guid;
+end;
 
 procedure InitializeWizard();
 begin
@@ -73,7 +92,7 @@ end;
   JSON ra 1 file tam de Pascal Script (khong the tu doc HTTP response truc
   tiep) doc lai. Tra ve True neu server xac nhan ma hop le (va vua danh dau
   da dung), False neu bi tu choi hoac loi ket noi. }
-function VerifyLicenseOnline(const Code: String; var ErrorMsg: String): Boolean;
+function VerifyLicenseOnline(const Code: String; const MachineId: String; var ErrorMsg: String): Boolean;
 var
   ResultFile, PsCommand: String;
   ResultCode: Integer;
@@ -86,12 +105,13 @@ begin
   { -NoProfile -NonInteractive de chay nhanh, on dinh, khong bi anh huong
     boi profile PowerShell cua may nguoi dung. Bat loi (try/catch) va LUON
     ghi ra file JSON du (ke ca khi loi ket noi), de Pascal Script luon doc
-    duoc ket qua thay vi bi treo cho input khong bao gio den. }
+    duoc ket qua thay vi bi treo cho input khong bao gio den. Gui kem
+    machineId de server GAN ma nay voi DUNG MAY dang cai dat. }
   PsCommand :=
     '-NoProfile -NonInteractive -Command "' +
     '$ErrorActionPreference=''Stop''; ' +
     'try { ' +
-    '  $body = @{ code = ''' + Code + ''' } | ConvertTo-Json; ' +
+    '  $body = @{ code = ''' + Code + '''; machineId = ''' + MachineId + ''' } | ConvertTo-Json; ' +
     '  $resp = Invoke-RestMethod -Uri ''' + LICENSE_API_URL + ''' -Method Post -Body $body -ContentType ''application/json'' -TimeoutSec 15; ' +
     '  $resp | ConvertTo-Json -Compress | Out-File -FilePath ''' + ResultFile + ''' -Encoding utf8; ' +
     '} catch { ' +
@@ -158,7 +178,7 @@ end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;
 var
-  Code, ErrorMsg: String;
+  Code, ErrorMsg, MachineId: String;
 begin
   Result := True;
   if CurPageID = LicensePage.ID then
@@ -181,12 +201,31 @@ begin
       Exit;
     end;
 
+    MachineId := GetMachineId();
+    if MachineId = '' then
+    begin
+      MsgBox('Không thể xác định định danh máy tính. Vui lòng liên hệ hỗ trợ.', mbError, MB_OK);
+      Result := False;
+      Exit;
+    end;
+
     WizardForm.Cursor := crHourglass;
     try
-      if not VerifyLicenseOnline(Code, ErrorMsg) then
+      if not VerifyLicenseOnline(Code, MachineId, ErrorMsg) then
       begin
         MsgBox(ErrorMsg, mbError, MB_OK);
         Result := False;
+      end
+      else
+      begin
+        { Luu lai token (ma + machineId) VAO THU MUC CAI DAT - ung dung
+          GCode Vision se doc file nay moi lan khoi dong de tu xac minh lai
+          voi server, dam bao dang chay DUNG TREN MAY da kich hoat. Thu muc
+          {app} co the CHUA TON TAI o thoi diem nay (truoc khi cac buoc cai
+          dat file chinh chay), nen phai tu tao truoc khi ghi file. }
+        ForceDirectories(ExpandConstant('{app}'));
+        SaveStringToFile(ExpandConstant('{app}\' + LICENSE_TOKEN_FILENAME),
+          Code + #13#10 + MachineId, False);
       end;
     finally
       WizardForm.Cursor := crDefault;

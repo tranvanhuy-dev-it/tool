@@ -1573,6 +1573,13 @@ class MainWindow(QMainWindow):
 def main():
     if sys.platform.startswith("linux") and not os.environ.get("QT_QPA_PLATFORM"):
         os.environ["QT_QPA_PLATFORM"] = "xcb"
+    # Kiem tra license NGAY TU DAU, TRUOC KHI tao MainWindow - CHI co tac
+    # dung tren ban DA DONG GOI (.exe), tu thoat neu may nay chua tung duoc
+    # kich hoat hop le (vd file .exe bi copy sang may khac). Khong lam gi
+    # ca khi dang chay tu source code (dev/test).
+    from gcode_vision.license_check import verify_license_or_exit
+    verify_license_or_exit()
+
     app = QApplication(sys.argv)
     win = MainWindow()
     win.showMaximized()
