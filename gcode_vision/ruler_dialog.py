@@ -21,7 +21,7 @@ from PyQt5.QtGui import QPainter, QPen, QColor, QMouseEvent, QKeySequence
 from PyQt5.QtCore import Qt, QPoint, QRect, pyqtSignal, QTimer
 
 RULER_THICKNESS = 26
-HANDLE_HIT_PX = 8
+HANDLE_HIT_PX = 14  # ban kinh vung bam de KEO 1 vach chia (rong hon nhieu so voi chinh cham tron 8px hien thi, de bam trung de dang bang chuot that)
 
 
 class _MmInputPopup(QWidget):
@@ -299,6 +299,13 @@ class RulerWidget(QWidget):
             # thay doi vi tri, de Ctrl+Z co the khoi phuc lai dung vi tri cu.
             self._push_undo_snapshot()
             self._dragging_index = idx
+            # Grab chuot: dam bao mouseMoveEvent/mouseReleaseEvent VAN duoc
+            # widget nay nhan ngay ca khi con tro di ra ngoai bien thuoc (rat
+            # de xay ra vi thuoc chi day 26px) trong luc dang keo - neu khong
+            # Qt co the chuyen event sang widget khac (vd canvas ben duoi) va
+            # thuoc se "mat" cac su kien mouseMoveEvent tiep theo, tao cam
+            # giac "keo khong phan hoi gi ca" ngay sau khi bam.
+            self.grabMouse()
             return
 
         if idx is None:
@@ -356,6 +363,7 @@ class RulerWidget(QWidget):
         if self._dragging_index is None:
             return
         self._dragging_index = None
+        self.releaseMouse()
         # Da keo xong -> ap dung calibration ngay voi vi tri moi (khong mo
         # popup, dung y nguoi dung da chon xong vi tri bang mat qua guide line).
         self._emit_calibration()
@@ -375,8 +383,11 @@ class RulerWidget(QWidget):
         self._push_undo_snapshot()  # luu truoc khi them vach moi, de Ctrl+Z go duoc
         self._insert_breakpoint(new_img_pos)
         self.update()
-        idx = self._breakpoints_img.index(new_img_pos)
-        self._open_mm_popup(idx, event.globalPos())
+        # KHONG tu dong mo popup nhap mm o day nua - chi them vach chia moi.
+        # Nguoi dung muon nhap do dai thi PHAI click DUNG VAO CON SO nhan (xem
+        # _find_label_at/_open_mm_popup_for_segment), giong het cach sua mm
+        # cho 1 doan da co san - nhat quan cho moi truong hop, tranh popup tu
+        # bat len ngoai y muon ngay khi vua them vach.
 
     def _insert_breakpoint(self, new_img_pos: float):
         """Them 1 vach chia moi tai new_img_pos, CHI noi suy mm TAM THOI cho
@@ -402,18 +413,6 @@ class RulerWidget(QWidget):
         # vach moi CHUA duoc nguoi dung xac nhan mm rieng (chi la noi suy tam),
         # nen danh dau CHUA CHOT - se duoc chot that khi ho nhap qua popup.
         self._fixed_mm.insert(i + 1, False)
-
-    def _open_mm_popup(self, breakpoint_index: int, global_pos: QPoint):
-        """Mo popup nhap mm cho DOAN ngay SAU vach chia breakpoint_index (tuc
-        doan giua breakpoint_index va breakpoint_index+1), hoac doan TRUOC no
-        neu day la vach cuoi cung. Dung khi VUA THEM 1 vach moi (double-click)."""
-        n = len(self._breakpoints_img)
-        if breakpoint_index >= n - 1:
-            seg_idx = breakpoint_index - 1
-        else:
-            seg_idx = breakpoint_index
-        seg_idx = max(0, min(n - 2, seg_idx))
-        self._open_mm_popup_for_segment(seg_idx, global_pos)
 
     def _open_mm_popup_for_segment(self, seg_idx: int, global_pos: QPoint):
         """Mo popup nhap mm cho DUNG doan co chi so seg_idx - dung khi nguoi

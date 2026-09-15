@@ -24,16 +24,19 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QPlainTextEdit, QLabel, QRadioButton, QButtonGroup, QPushButton,
     QFileDialog, QStatusBar, QSplitter, QMessageBox, QSlider, QDoubleSpinBox,
-    QSpinBox, QCheckBox, QColorDialog, QGridLayout
+    QSpinBox, QCheckBox, QColorDialog, QGridLayout, QComboBox, QTextEdit,
 )
-from PyQt5.QtGui import QFont, QSyntaxHighlighter, QTextCharFormat, QColor, QIcon, QKeySequence
+from PyQt5.QtGui import QFont, QSyntaxHighlighter, QTextCharFormat, QColor, QIcon, QKeySequence, QTextFormat
 from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtWidgets import QShortcut, QTableWidget, QTableWidgetItem, QAbstractItemView
+from PyQt5.QtWidgets import QShortcut, QTableWidget, QTableWidgetItem, QAbstractItemView, QFrame
 import re
 import datetime
 import shutil
 
-from gcode_vision.gcode_parser import parse_gcode, convert_gcode_mode, estimate_machining_time_seconds
+from gcode_vision.gcode_parser import (
+    parse_gcode, convert_gcode_mode, estimate_machining_time_seconds,
+    arc_to_polyline, ParseResult
+)
 from gcode_vision.canvas_widget import CanvasWidget
 from gcode_vision.gcode_editor import GcodeEditor
 from gcode_vision.ruler_dialog import RulerWidget, RULER_THICKNESS
@@ -71,7 +74,13 @@ class MainWindow(QMainWindow):
         logo_path = os.path.join(os.path.dirname(__file__), "..", "assets", "logo.png")
         if os.path.exists(logo_path):
             self.setWindowIcon(QIcon(logo_path))
-        self.resize(1400, 850)
+        # Tu dong thiet lap geometry ban dau vua khit man hinh kha dung
+        screen = QApplication.primaryScreen()
+        avail = screen.availableGeometry() if screen else None
+        if avail is not None:
+            self.setGeometry(avail)
+        else:
+            self.resize(1366, 768)
 
         self.absolute_mode = True   # True = G90, False = G91
         self.last_ref_point = (0.0, 0.0)  # diem tham chieu cho che do tuong doi
@@ -87,16 +96,55 @@ class MainWindow(QMainWindow):
         self._current_file_path = None  # duong dan file dang mo, None neu chua tung luu/mo
         self._dirty = False  # co thay doi CHUA duoc luu ke tu lan luu/mo gan nhat
 
+        # --- Mo phong chuyen dong mui dao CNC ---
+        self._sim_timer = QTimer(self)
+        self._sim_timer.setInterval(33)  # ~30 FPS
+        self._sim_timer.timeout.connect(self._sim_tick)
+        self._sim_running = False
+        self._sim_trajectory = []
+        self._sim_total_duration = 0.0
+        self._sim_current_time = 0.0
+        self._sim_speed_multiplier = 1.0
+        self._sim_is_seeking = False
+        self._last_highlighted_sim_line = None
+
         self._build_ui()
         self._connect_signals()
         self._refresh_color_swatches()
-        self.btn_dark_mode.setChecked(True)  # mac dinh mo che do toi
+        # setChecked() CHI phat tin hieu toggled neu gia tri THAY DOI so voi
+        # hien tai - vi QPushButton.setCheckable(True) mac dinh la False, goi
+        # setChecked(False) o day KHONG kich hoat _toggle_dark_mode(), nen goi
+        # TUONG MINH de dam bao moi phan cua UI (bao gom GcodeEditor._is_dark_mode)
+        # luon dong bo dung trang thai NGAY TU DAU, khong phu thuoc gia tri
+        # mac dinh "cung" o noi khac co khop hay khong.
+        self.btn_dark_mode.setChecked(False)
+        self._toggle_dark_mode(False)
+
+        # Noi dung mac dinh khi vua mo app: dong G90 (che do tuyet doi, dung
+        # theo self.absolute_mode mac dinh = True) - GIONG HET hanh vi "Tao
+        # moi", de nguoi dung khong phai tu go dong nay moi lan mo ung dung.
+        # Goi block/unblock tin hieu textChanged de KHONG bi danh dau "chua
+        # luu" (_dirty=True) chi vi dong mac dinh nay - _dirty chi nen bat khi
+        # NGUOI DUNG thuc su go them noi dung.
+        mode_line = "G90" if self.absolute_mode else "G91"
+        self.editor.blockSignals(True)
+        self.editor.setPlainText(mode_line + "\n")
+        self.editor.blockSignals(False)
+
         self._render()
 
         self._setup_autosave()
-        self._offer_restore_autosave()
+        self._offer_restore_autosave()  # co the GHI DE lai bang ban nhap cu neu nguoi dung dong y
         self._setup_shortcuts()
         self._update_window_title()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if hasattr(self, 'splitter'):
+            w = self.splitter.width()
+            if w > 100:
+                self.splitter.setSizes([round(w / 3.0), round(w * 2.0 / 3.0)])
+        QTimer.singleShot(60, self.canvas.fit_view)
 
     # ---------------- UI ----------------
 
@@ -104,146 +152,19 @@ class MainWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
+        # Bo HOAN TOAN margin mac dinh (~9-11px) cua QVBoxLayout - de canh
+        # TRAI/PHAI cua noi dung chinh (splitter chua editor/canvas) SAT MEP
+        # cua so y HET nhu QStatusBar duoi cung (status bar do QMainWindow tu
+        # quan ly, khong co margin ngoai), tranh lech cot giua 2 khu vuc.
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(6)
 
-        # --- 2 hang can doi, chiem het chieu ngang ---
-        # hang 1: Tep + He toa do khi click
-        row1 = QHBoxLayout()
-        row1.setSpacing(16)
-
-        grp_file, l = self._section("Tệp")
-        self.btn_new = QPushButton("Tạo mới")
-        self.btn_open = QPushButton("Mở G-code")
-        self.btn_save = QPushButton("Xuất G-code (.txt)")
-        self.btn_undo = QPushButton("Hoàn tác")
-        l.addWidget(self.btn_new)
-        l.addWidget(self.btn_open)
-        l.addWidget(self.btn_save)
-        l.addWidget(self.btn_undo)
-
-        grp_coord, l = self._section("Hệ tọa độ khi click")
-        self.radio_abs = QRadioButton("Tuyệt đối (G90)")
-        self.radio_rel = QRadioButton("Tương đối (G91)")
-        self.radio_abs.setChecked(True)
-        coord_group = QButtonGroup(self)
-        coord_group.addButton(self.radio_abs)
-        coord_group.addButton(self.radio_rel)
-        l.addWidget(self.radio_abs)
-        l.addWidget(self.radio_rel)
-        l.addWidget(QLabel("Số thập phân:"))
-        self.spin_decimals = QSpinBox()
-        self.spin_decimals.setRange(0, 6)
-        self.spin_decimals.setValue(0)
-        self.spin_decimals.setMinimumWidth(55)
-        l.addWidget(self.spin_decimals)
-        self.chk_snap = QCheckBox("Hút lưới")
-        self.chk_snap.setChecked(True)
-        l.addWidget(self.chk_snap)
-        l.addWidget(QLabel("Cỡ điểm giao (px):"))
-        self.spin_marker_size = QSpinBox()
-        self.spin_marker_size.setRange(2, 40)
-        self.spin_marker_size.setValue(9)
-        self.spin_marker_size.setMinimumWidth(55)
-        l.addWidget(self.spin_marker_size)
-        self.chk_measure_mode = QCheckBox("Đo khoảng cách (không chèn G-code)")
-        l.addWidget(self.chk_measure_mode)
-        self.chk_auto_n = QCheckBox("Tự đánh số N, bước:")
-        self.chk_auto_n.setChecked(True)
-        l.addWidget(self.chk_auto_n)
-        self.spin_n_step = QSpinBox()
-        self.spin_n_step.setRange(1, 1000)
-        self.spin_n_step.setValue(1)
-        self.spin_n_step.setMinimumWidth(55)
-        l.addWidget(self.spin_n_step)
-        row1.addWidget(grp_file)
-        row1.addWidget(grp_coord)
-        row1.addStretch()
-
-        self.lbl_website = QLabel('<a href="https://www.tranvanhuy.io.vn">tranvanhuy.io.vn</a>')
-        self.lbl_website.setOpenExternalLinks(True)
-        row1.addWidget(self.lbl_website)
-
-        self.btn_zoom_out = QPushButton("−")
-        self.btn_zoom_out.setMinimumWidth(32)
-        row1.addWidget(self.btn_zoom_out)
-        self.lbl_zoom_pct = QLabel("100%")
-        self.lbl_zoom_pct.setMinimumWidth(44)
-        self.lbl_zoom_pct.setAlignment(Qt.AlignCenter)
-        row1.addWidget(self.lbl_zoom_pct)
-        self.btn_zoom_in = QPushButton("+")
-        self.btn_zoom_in.setMinimumWidth(32)
-        row1.addWidget(self.btn_zoom_in)
-
-        self.btn_dark_mode = QPushButton("Chế độ tối")
-        self.btn_dark_mode.setCheckable(True)
-        row1.addWidget(self.btn_dark_mode)
-        root.addLayout(row1)
-
-        # hang 2: Anh ban ve tham chieu, Mau net ve
-        row2 = QHBoxLayout()
-        row2.setSpacing(16)
-
-        grp_img, l = self._section("Ảnh bản vẽ tham chiếu")
-        self.btn_load_image = QPushButton("Tải ảnh...")
-        l.addWidget(self.btn_load_image)
-        l.addWidget(QLabel("Rộng phôi (mm):"))
-        self.spin_width = QDoubleSpinBox()
-        self.spin_width.setRange(0.01, 100000)
-        self.spin_width.setDecimals(2)
-        self.spin_width.setValue(100.0)
-        self.spin_width.setMinimumWidth(85)
-        l.addWidget(self.spin_width)
-        l.addWidget(QLabel("Cao phôi (mm):"))
-        self.spin_height = QDoubleSpinBox()
-        self.spin_height.setRange(0.01, 100000)
-        self.spin_height.setDecimals(2)
-        self.spin_height.setValue(100.0)
-        self.spin_height.setMinimumWidth(85)
-        l.addWidget(self.spin_height)
-        l.addWidget(QLabel("a (X):"))
-        self.spin_ax = QDoubleSpinBox()
-        self.spin_ax.setRange(-100000, 100000)
-        self.spin_ax.setDecimals(3)
-        self.spin_ax.setMinimumWidth(85)
-        l.addWidget(self.spin_ax)
-        l.addWidget(QLabel("a (Y):"))
-        self.spin_ay = QDoubleSpinBox()
-        self.spin_ay.setRange(-100000, 100000)
-        self.spin_ay.setDecimals(3)
-        self.spin_ay.setMinimumWidth(85)
-        l.addWidget(self.spin_ay)
-        l.addWidget(QLabel("Ô lưới (mm):"))
-        self.spin_grid = QDoubleSpinBox()
-        self.spin_grid.setRange(0.01, 10000)
-        self.spin_grid.setDecimals(2)
-        self.spin_grid.setValue(1.0)
-        self.spin_grid.setMinimumWidth(75)
-        l.addWidget(self.spin_grid)
-        l.addWidget(QLabel("Độ mờ ảnh nền:"))
-        self.slider_opacity = QSlider(Qt.Horizontal)
-        self.slider_opacity.setRange(10, 100)
-        self.slider_opacity.setValue(50)
-        self.slider_opacity.setFixedWidth(100)
-        l.addWidget(self.slider_opacity)
-        row2.addWidget(grp_img)
-
-        grp_colors, l = self._section("Màu nét vẽ")
-        self._color_buttons = {}
-        for key, label in (("cut", "Cắt"), ("rapid", "Chạy nhanh"),
-                            ("grid", "Lưới"), ("axis", "Trục")):
-            l.addWidget(QLabel(label))
-            btn = QPushButton()
-            btn.setFixedSize(24, 24)
-            btn.clicked.connect(lambda _, k=key: self._pick_color(k))
-            self._color_buttons[key] = btn
-            l.addWidget(btn)
-        row2.addWidget(grp_colors)
-        row2.addStretch()
-
-        root.addLayout(row2)
+        self.settings_panel = self._build_settings_panel()
+        root.addWidget(self.settings_panel)
 
         # --- vung chinh: splitter 2 cot ---
-        splitter = QSplitter(Qt.Horizontal)
-        root.addWidget(splitter, stretch=1)
+        self.splitter = QSplitter(Qt.Horizontal)
+        root.addWidget(self.splitter, stretch=1)
 
         left = QWidget()
         left_layout = QVBoxLayout(left)
@@ -257,6 +178,10 @@ class MainWindow(QMainWindow):
         left_splitter = QSplitter(Qt.Vertical)
         left_splitter.addWidget(self.editor)
 
+        # Bang danh sach diem VAN duoc tao (nhieu noi khac trong code van cap
+        # nhat/doc no, vd khi highlight dong dang mo phong) nhung KHONG hien
+        # thi tren giao dien nua - de vung soan thao G-code chiem toan bo
+        # chieu cao cot trai, thoang va tap trung hon.
         points_panel = QWidget()
         points_layout = QVBoxLayout(points_panel)
         points_layout.setContentsMargins(0, 0, 0, 0)
@@ -268,23 +193,94 @@ class MainWindow(QMainWindow):
         self.table_points.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table_points.verticalHeader().setVisible(False)
         points_layout.addWidget(self.table_points)
+        points_panel.setVisible(False)
         left_splitter.addWidget(points_panel)
-        left_splitter.setSizes([600, 200])
+        left_splitter.setSizes([1, 0])
+        left_splitter.setStretchFactor(0, 1)
+        left_splitter.setStretchFactor(1, 0)
 
         left_layout.addWidget(left_splitter)
-        splitter.addWidget(left)
+        self.splitter.addWidget(left)
 
         right = QWidget()
         right_layout = QVBoxLayout(right)
         right_header = QHBoxLayout()
         right_header.addWidget(QLabel("Xem trước đường chạy dao"))
+        right_header.addSpacing(14)
 
+        # Cum dieu khien mo phong mui dao CNC
+        # Chieu cao CO DINH chung cho ca 4 nut (Chay thu + 3 nut icon) - neu
+        # khong moi nut se co sizeHint() rieng theo font/noi dung cua no (nut
+        # chu "Chay thu" dung font mac dinh, 3 nut icon dung font khac) va bi
+        # LECH chieu cao ro ret khi dat canh nhau tren cung 1 hang.
+        SIM_BTN_HEIGHT = 34
+
+        self.btn_sim_play = QPushButton("▶ Chạy thử")
+        self.btn_sim_play.setToolTip("Bắt đầu / Tạm dừng mô phỏng chuyển động mũi dao")
+        self.btn_sim_play.setMinimumWidth(85)
+        self.btn_sim_play.setFixedHeight(SIM_BTN_HEIGHT)
+        self.btn_sim_play.setStyleSheet("color: #16a34a; font-weight: bold;")
+        right_header.addWidget(self.btn_sim_play)
+
+        btn_ctrl_font = QFont()
+        btn_ctrl_font.setPointSize(11)
+
+        self.btn_sim_stop = QPushButton("⏹")
+        self.btn_sim_stop.setObjectName("sim_ctrl")
+        self.btn_sim_stop.setFont(btn_ctrl_font)
+        self.btn_sim_stop.setToolTip("Dừng mô phỏng và về điểm đầu")
+        self.btn_sim_stop.setMinimumWidth(34)
+        self.btn_sim_stop.setFixedHeight(SIM_BTN_HEIGHT)
+        self.btn_sim_stop.setStyleSheet("color: #dc2626; font-weight: bold;")
+        right_header.addWidget(self.btn_sim_stop)
+
+        self.btn_sim_prev = QPushButton("⏮")
+        self.btn_sim_prev.setObjectName("sim_ctrl")
+        self.btn_sim_prev.setFont(btn_ctrl_font)
+        self.btn_sim_prev.setToolTip("Lùi 1 câu lệnh")
+        self.btn_sim_prev.setMinimumWidth(34)
+        self.btn_sim_prev.setFixedHeight(SIM_BTN_HEIGHT)
+        right_header.addWidget(self.btn_sim_prev)
+
+        self.btn_sim_step = QPushButton("⏭")
+        self.btn_sim_step.setObjectName("sim_ctrl")
+        self.btn_sim_step.setFont(btn_ctrl_font)
+        self.btn_sim_step.setToolTip("Tiến 1 câu lệnh")
+        self.btn_sim_step.setMinimumWidth(34)
+        self.btn_sim_step.setFixedHeight(SIM_BTN_HEIGHT)
+        right_header.addWidget(self.btn_sim_step)
+
+        self.slider_sim_progress = QSlider(Qt.Horizontal)
+        self.slider_sim_progress.setRange(0, 1000)
+        self.slider_sim_progress.setValue(0)
+        self.slider_sim_progress.setFixedWidth(120)
+        self.slider_sim_progress.setToolTip("Tua nhanh tiến trình mô phỏng")
+        right_header.addWidget(self.slider_sim_progress)
+
+        self.combo_sim_speed = QComboBox()
+        self.combo_sim_speed.addItems(["0.5x", "1x", "2x", "5x", "10x"])
+        self.combo_sim_speed.setCurrentText("1x")
+        self.combo_sim_speed.setFixedWidth(80)
+        self.combo_sim_speed.setToolTip("Tốc độ chạy mô phỏng")
+        right_header.addWidget(self.combo_sim_speed)
+
+        self.lbl_sim_hud = QLabel("")
+        hud_font = QFont("Consolas", 10)
+        hud_font.setBold(True)
+        self.lbl_sim_hud.setFont(hud_font)
+        self.lbl_sim_hud.setStyleSheet("color: #10b981;")
+        right_header.addWidget(self.lbl_sim_hud)
+
+        right_header.addStretch()
+
+        # Toa do chuot: day sat qua mep phai cua hang
         self.lbl_mouse_coord = QLabel("X —   Y —")
-        coord_font = QFont("Consolas", 12)
+        coord_font = QFont("Consolas", 9)
         coord_font.setBold(True)
         self.lbl_mouse_coord.setFont(coord_font)
+        self.lbl_mouse_coord.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.lbl_mouse_coord.setMinimumWidth(100)
         right_header.addWidget(self.lbl_mouse_coord)
-        right_header.addStretch()
 
         right_layout.addLayout(right_header)
 
@@ -308,13 +304,210 @@ class MainWindow(QMainWindow):
         grid.addWidget(self.canvas, 1, 1)
 
         right_layout.addWidget(canvas_grid)
-        splitter.addWidget(right)
+        self.splitter.addWidget(right)
 
-        splitter.setSizes([420, 980])
+        screen = QApplication.primaryScreen()
+        avail = screen.availableGeometry() if screen else None
+        total_w = avail.width() if avail else 1400
+        left_w = round(total_w / 3.0)
+        right_w = total_w - left_w
+        self.splitter.setSizes([left_w, right_w])
+        self.splitter.setStretchFactor(0, 1)
+        self.splitter.setStretchFactor(1, 2)
 
         self.status = QStatusBar()
         self.setStatusBar(self.status)
         self.status.showMessage("Sẵn sàng.")
+
+        # Link website, zoom UI, dark mode - dat CUNG HANG voi status bar
+        # duoi cung, o ben phai, bang addPermanentWidget() (widget "permanent"
+        # luon o mep phai, khong bi de boi noi dung showMessage() tam thoi ben
+        # trai) - KHONG dat rieng thanh 1 hang trong cot phai (se chiem mot
+        # khoang khong gian rieng, lam mat can doi voi cot trai ben duoi).
+        self.lbl_website = QLabel('<a href="https://www.tranvanhuy.io.vn">tranvanhuy.io.vn</a>')
+        self.lbl_website.setOpenExternalLinks(True)
+        self.status.addPermanentWidget(self.lbl_website)
+
+        self.btn_zoom_out = QPushButton("−")
+        self.btn_zoom_out.setMinimumWidth(28)
+        self.btn_zoom_out.setToolTip("Thu nhỏ giao diện")
+        self.status.addPermanentWidget(self.btn_zoom_out)
+        self.lbl_zoom_pct = QLabel("100%")
+        self.lbl_zoom_pct.setMinimumWidth(44)
+        self.lbl_zoom_pct.setAlignment(Qt.AlignCenter)
+        self.status.addPermanentWidget(self.lbl_zoom_pct)
+        self.btn_zoom_in = QPushButton("+")
+        self.btn_zoom_in.setMinimumWidth(28)
+        self.btn_zoom_in.setToolTip("Phóng to giao diện")
+        self.status.addPermanentWidget(self.btn_zoom_in)
+
+        self.btn_dark_mode = QPushButton("Chế độ tối")
+        self.btn_dark_mode.setCheckable(True)
+        self.status.addPermanentWidget(self.btn_dark_mode)
+
+    @staticmethod
+    def _vsep() -> QFrame:
+        """Duong phan cach DOC mong, dung giua cac NHOM chuc nang khac nhau
+        tren cung 1 hang - giup mat de nhan ra ranh gioi giua cac nhom, tranh
+        cam giac moi widget dinh lien nhau thanh 1 khoi duy nhat kho doc."""
+        sep = QFrame()
+        sep.setFrameShape(QFrame.VLine)
+        sep.setFrameShadow(QFrame.Sunken)
+        return sep
+
+    def _build_settings_panel(self) -> QWidget:
+        """Panel thiet lap chi tiet, LUON HIEN duoi toolbar - gom: he toa do
+        khi click, tuy chon luoi/diem giao, anh ban ve tham chieu & phoi, mau
+        net ve. Cac NHOM duoc ngan cach bang khoang trang RONG HON han so voi
+        khoang cach GIUA CAC WIDGET trong cung 1 nhom, cong them 1 duong ke
+        doc (_vsep) - de mat de phan biet ranh gioi nhom, tranh cam giac moi
+        thu dinh lien nhau thanh 1 day dai kho doc/kho dung."""
+        GROUP_GAP = 22   # khoang cach GIUA 2 NHOM khac nhau
+        panel = QWidget()
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(0, 6, 0, 6)
+        panel_layout.setSpacing(10)
+
+        # --- hang 1 cua panel: Tep + He toa do + Luoi/diem giao + Che do click + Danh so dong ---
+        row1 = QHBoxLayout()
+        row1.setSpacing(0)
+
+        grp_file, l = self._section("Tệp")
+        self.btn_new = QPushButton("Tạo mới")
+        self.btn_open = QPushButton("Mở G-code")
+        self.btn_save = QPushButton("Xuất G-code (.txt)")
+        for b in (self.btn_new, self.btn_open, self.btn_save):
+            l.addWidget(b)
+        row1.addWidget(grp_file)
+        row1.addSpacing(GROUP_GAP)
+        row1.addWidget(self._vsep())
+        row1.addSpacing(GROUP_GAP)
+
+        grp_coord, l = self._section("Hệ tọa độ khi chèn điểm")
+        self.radio_abs = QRadioButton("Tuyệt đối (G90)")
+        self.radio_rel = QRadioButton("Tương đối (G91)")
+        self.radio_abs.setChecked(True)
+        coord_group = QButtonGroup(self)
+        coord_group.addButton(self.radio_abs)
+        coord_group.addButton(self.radio_rel)
+        l.addWidget(self.radio_abs)
+        l.addWidget(self.radio_rel)
+        l.addSpacing(10)
+        l.addWidget(QLabel("Số chữ số thập phân:"))
+        self.spin_decimals = QSpinBox()
+        self.spin_decimals.setRange(0, 6)
+        self.spin_decimals.setValue(0)
+        self.spin_decimals.setMinimumWidth(58)
+        l.addWidget(self.spin_decimals)
+        row1.addWidget(grp_coord)
+        row1.addSpacing(GROUP_GAP)
+        row1.addWidget(self._vsep())
+        row1.addSpacing(GROUP_GAP)
+
+        grp_snap, l = self._section("Lưới & điểm giao khi click")
+        self.chk_snap = QCheckBox("Hút lưới")
+        self.chk_snap.setChecked(True)
+        l.addWidget(self.chk_snap)
+        l.addWidget(QLabel("Cỡ điểm giao (px):"))
+        self.spin_marker_size = QSpinBox()
+        self.spin_marker_size.setRange(2, 40)
+        self.spin_marker_size.setValue(9)
+        self.spin_marker_size.setMinimumWidth(58)
+        l.addWidget(self.spin_marker_size)
+        row1.addWidget(grp_snap)
+        row1.addSpacing(GROUP_GAP)
+        row1.addWidget(self._vsep())
+        row1.addSpacing(GROUP_GAP)
+
+        grp_click_mode, l = self._section("Chế độ click trên bản vẽ")
+        self.chk_measure_mode = QCheckBox("Đo khoảng cách (không chèn G-code)")
+        self.chk_measure_mode.setChecked(False)  # mac dinh TAT - click canvas se chen toa do nhu binh thuong
+        l.addWidget(self.chk_measure_mode)
+        row1.addWidget(grp_click_mode)
+        row1.addSpacing(GROUP_GAP)
+        row1.addWidget(self._vsep())
+        row1.addSpacing(GROUP_GAP)
+
+        grp_autonum, l = self._section("Đánh số dòng (N)")
+        self.chk_auto_n = QCheckBox("Tự động, bước:")
+        self.chk_auto_n.setChecked(True)
+        l.addWidget(self.chk_auto_n)
+        self.spin_n_step = QSpinBox()
+        self.spin_n_step.setRange(1, 1000)
+        self.spin_n_step.setValue(1)
+        self.spin_n_step.setMinimumWidth(65)
+        l.addWidget(self.spin_n_step)
+        row1.addWidget(grp_autonum)
+        row1.addStretch()
+
+        # --- hang 2 cua panel: Anh ban ve tham chieu & Phoi + Mau net ve ---
+        row3 = QHBoxLayout()
+        row3.setSpacing(0)
+
+        grp_img, l = self._section("Ảnh bản vẽ tham chiếu & kích thước phôi")
+        self.btn_load_image = QPushButton("Tải ảnh...")
+        l.addWidget(self.btn_load_image)
+        l.addWidget(QLabel("Rộng (mm):"))
+        self.spin_width = QDoubleSpinBox()
+        self.spin_width.setRange(0.01, 100000)
+        self.spin_width.setDecimals(2)
+        self.spin_width.setValue(100.0)
+        self.spin_width.setMinimumWidth(95)
+        l.addWidget(self.spin_width)
+        l.addWidget(QLabel("Cao (mm):"))
+        self.spin_height = QDoubleSpinBox()
+        self.spin_height.setRange(0.01, 100000)
+        self.spin_height.setDecimals(2)
+        self.spin_height.setValue(100.0)
+        self.spin_height.setMinimumWidth(95)
+        l.addWidget(self.spin_height)
+        l.addSpacing(10)
+        l.addWidget(QLabel("Offset gốc a(X, Y):"))
+        self.spin_ax = QDoubleSpinBox()
+        self.spin_ax.setRange(-100000, 100000)
+        self.spin_ax.setDecimals(3)
+        self.spin_ax.setMinimumWidth(90)
+        l.addWidget(self.spin_ax)
+        self.spin_ay = QDoubleSpinBox()
+        self.spin_ay.setRange(-100000, 100000)
+        self.spin_ay.setDecimals(3)
+        self.spin_ay.setMinimumWidth(90)
+        l.addWidget(self.spin_ay)
+        l.addSpacing(10)
+        l.addWidget(QLabel("Ô lưới (mm):"))
+        self.spin_grid = QDoubleSpinBox()
+        self.spin_grid.setRange(0.01, 10000)
+        self.spin_grid.setDecimals(2)
+        self.spin_grid.setValue(1.0)
+        self.spin_grid.setMinimumWidth(85)
+        l.addWidget(self.spin_grid)
+        l.addWidget(QLabel("Độ mờ ảnh nền:"))
+        self.slider_opacity = QSlider(Qt.Horizontal)
+        self.slider_opacity.setRange(10, 100)
+        self.slider_opacity.setValue(50)
+        self.slider_opacity.setFixedWidth(90)
+        l.addWidget(self.slider_opacity)
+        row3.addWidget(grp_img)
+        row3.addSpacing(GROUP_GAP)
+        row3.addWidget(self._vsep())
+        row3.addSpacing(GROUP_GAP)
+
+        grp_colors, l = self._section("Màu nét vẽ")
+        self._color_buttons = {}
+        for key, label in (("cut", "Cắt"), ("rapid", "Chạy nhanh"),
+                            ("grid", "Lưới"), ("axis", "Trục")):
+            l.addWidget(QLabel(label))
+            btn = QPushButton()
+            btn.setFixedSize(22, 22)
+            btn.clicked.connect(lambda _, k=key: self._pick_color(k))
+            self._color_buttons[key] = btn
+            l.addWidget(btn)
+        row3.addWidget(grp_colors)
+        row3.addStretch()
+
+        panel_layout.addLayout(row1)
+        panel_layout.addLayout(row3)
+        return panel
 
     @staticmethod
     def _section(title: str):
@@ -348,7 +541,6 @@ class MainWindow(QMainWindow):
         self.btn_new.clicked.connect(self._new_file)
         self.btn_open.clicked.connect(self._open_file)
         self.btn_save.clicked.connect(self._save_file)
-        self.btn_undo.clicked.connect(self._on_canvas_undo)
 
         self.btn_load_image.clicked.connect(self._load_drawing_image)
         self.ruler_x.calibration_changed.connect(self._on_ruler_calibration_changed)
@@ -364,6 +556,16 @@ class MainWindow(QMainWindow):
         self.btn_dark_mode.toggled.connect(self._toggle_dark_mode)
         self.btn_zoom_in.clicked.connect(lambda: self._change_ui_scale(10))
         self.btn_zoom_out.clicked.connect(lambda: self._change_ui_scale(-10))
+
+        # Tin hieu mo phong mui dao CNC
+        self.btn_sim_play.clicked.connect(self._sim_toggle_play)
+        self.btn_sim_stop.clicked.connect(self._sim_stop)
+        self.btn_sim_prev.clicked.connect(self._sim_step_backward)
+        self.btn_sim_step.clicked.connect(self._sim_step_forward)
+        self.slider_sim_progress.sliderMoved.connect(self._sim_on_slider_moved)
+        self.slider_sim_progress.sliderPressed.connect(self._sim_on_slider_pressed)
+        self.slider_sim_progress.sliderReleased.connect(self._sim_on_slider_released)
+        self.combo_sim_speed.currentIndexChanged.connect(self._sim_on_speed_changed)
 
     # ---------------- logic ----------------
 
@@ -395,6 +597,7 @@ class MainWindow(QMainWindow):
     def _toggle_dark_mode(self, dark: bool):
         """Bat/tat che do toi: doi mau nen/chu toan bo giao dien bang 1 stylesheet
         don gian, khong anh huong bo cuc/spacing da co san."""
+        self.editor.set_dark_mode(dark)
         if dark:
             self.setStyleSheet("""
                 QWidget { background-color: #2b2b2b; color: #e0e0e0; }
@@ -402,7 +605,13 @@ class MainWindow(QMainWindow):
                 QPushButton { background-color: #3c3c3c; border: 1px solid #555; padding: 6px 12px; }
                 QPushButton:hover { background-color: #4a4a4a; }
                 QPushButton:checked { background-color: #0a5a9c; }
+                QPushButton#sim_ctrl { padding: 4px 6px; }
                 QDoubleSpinBox, QSpinBox { background-color: #1e1e1e; color: #dcdcdc; border: 1px solid #555; padding: 2px 4px; }
+                QComboBox { background-color: #1e1e1e; color: #dcdcdc; border: 1px solid #555; padding: 2px 6px; }
+                QComboBox QAbstractItemView { background-color: #2b2b2b; color: #dcdcdc; selection-background-color: #0a5a9c; }
+                QSlider::groove:horizontal { height: 4px; background: #555; border-radius: 2px; }
+                QSlider::sub-page:horizontal { background: #10b981; border-radius: 2px; }
+                QSlider::handle:horizontal { background: #e0e0e0; width: 12px; margin-top: -4px; margin-bottom: -4px; border-radius: 6px; }
             """)
             self.btn_dark_mode.setText("Chế độ sáng")
             link_color = "#6ab0f3"
@@ -417,10 +626,9 @@ class MainWindow(QMainWindow):
             f'<a href="https://www.tranvanhuy.io.vn" style="color:{link_color};">tranvanhuy.io.vn</a>'
         )
 
-        # Ep Qt tinh lai kich thuoc cac nut theo padding moi cua stylesheet - neu
-        # khong, nut giu nguyen sizeHint cu (tu luc khoi tao) va chu bi cat/tran.
-        for btn in self.findChildren(QPushButton):
-            btn.updateGeometry()
+        # Ep Qt tinh lai kich thuoc cac nut va spinbox theo padding moi cua stylesheet
+        for w in self.findChildren((QPushButton, QSpinBox, QDoubleSpinBox, QComboBox)):
+            w.updateGeometry()
 
     def _on_mode_toggled(self, checked):
         new_absolute = self.radio_abs.isChecked()
@@ -467,20 +675,35 @@ class MainWindow(QMainWindow):
         try:
             result = parse_gcode(text)
         except Exception as e:
-            self.status.showMessage(f"Lỗi phân tích G-code: {e}")
+            err_msg = str(e)
+            self.status.showMessage(f"Lỗi phân tích G-code: {err_msg}")
+            m = re.search(r"Dòng\s+(\d+)", err_msg)
+            if m:
+                self.editor.set_error_lines({int(m.group(1)): err_msg})
             return
+
+        error_lines = {}
+        for w in result.warnings:
+            m = re.search(r"Dòng\s+(\d+)", w)
+            if m:
+                error_lines[int(m.group(1))] = w
+        self.editor.set_error_lines(error_lines)
+
         self.canvas.render_program(result)
         self.last_ref_point = (result.end_x, result.end_y)
         nd = self.spin_decimals.value()
         self._refresh_points_table(result.segments, nd)
+        self._build_simulation_trajectory(result)
 
         time_str = self._format_machining_time(result.segments)
+        # KHONG con noi canh bao (result.warnings) vao day nua - status bar chi
+        # hien thong so gon gang (so doan, vi tri dao, thoi gian uoc tinh). Chi
+        # tiet loi/canh bao tung dong da hien qua tooltip khi hover vao dong do
+        # trong editor (xem set_error_lines() va GcodeEditor xu ly QEvent.ToolTip).
         msg = (
             f"{len(result.segments)} đoạn di chuyển | Vị trí dao hiện tại: "
             f"X{result.end_x:.{nd}f} Y{result.end_y:.{nd}f} | Ước tính thời gian: {time_str}"
         )
-        if result.warnings:
-            msg += f"  ⚠ {result.warnings[0]}"
         self.status.showMessage(msg)
 
     def _refresh_points_table(self, segments, nd: int):
@@ -820,6 +1043,249 @@ class MainWindow(QMainWindow):
             hexcol = colors.get(key, "#000000")
             btn.setStyleSheet(f"background-color: {hexcol};")
 
+    # ---------------- mo phong mui dao CNC ----------------
+
+    def _build_simulation_trajectory(self, result: ParseResult):
+        """Xay dung du lieu quy dao mo phong noi suy theo thoi gian va quang duong."""
+        self._sim_trajectory = []
+        cum_time = 0.0
+
+        for seg in result.segments:
+            if seg.kind == "line":
+                length = math.hypot(seg.x1 - seg.x0, seg.y1 - seg.y0)
+                sub_pts = [(seg.x0, seg.y0), (seg.x1, seg.y1)]
+                r0 = 0.0
+                a0 = 0.0
+                a1 = 0.0
+            else:
+                r0 = math.hypot(seg.x0 - seg.cx, seg.y0 - seg.cy)
+                a0 = math.atan2(seg.y0 - seg.cy, seg.x0 - seg.cx)
+                a1 = math.atan2(seg.y1 - seg.cy, seg.x1 - seg.cx)
+                if seg.cw:
+                    while a1 >= a0:
+                        a1 -= 2 * math.pi
+                else:
+                    while a1 <= a0:
+                        a1 += 2 * math.pi
+                sweep = abs(a1 - a0)
+                length = r0 * sweep
+                sub_pts = arc_to_polyline(seg, max_segments=32)
+
+            if seg.rapid:
+                speed_mm_s = 90.0
+                duration = max(0.12, length / speed_mm_s)
+            else:
+                f_rate = seg.feed_rate if seg.feed_rate > 0 else 1200.0
+                speed_mm_s = max(15.0, min(65.0, f_rate / 60.0))
+                duration = max(0.15, length / speed_mm_s)
+
+            item = {
+                "seg": seg,
+                "length": length,
+                "duration": duration,
+                "start_time": cum_time,
+                "end_time": cum_time + duration,
+                "sub_pts": sub_pts,
+                "r0": r0,
+                "a0": a0,
+                "a1": a1,
+            }
+            self._sim_trajectory.append(item)
+            cum_time += duration
+
+        self._sim_total_duration = cum_time
+        if not self._sim_running:
+            self._sim_current_time = 0.0
+            if self.slider_sim_progress.value() == 0:
+                self.canvas.hide_tool()
+                self.canvas.clear_sim_trail()
+
+    def _sim_toggle_play(self):
+        if not self._sim_trajectory:
+            self._render()
+            if not self._sim_trajectory:
+                self.status.showMessage("Chưa có đường chạy dao để mô phỏng.")
+                return
+
+        if self._sim_running:
+            self._sim_pause()
+        else:
+            if self._sim_total_duration > 0 and self._sim_current_time >= self._sim_total_duration - 0.01:
+                self._sim_current_time = 0.0
+                self.canvas.clear_sim_trail()
+            self._sim_play()
+
+    def _sim_play(self):
+        self._sim_running = True
+        self.btn_sim_play.setText("⏸ Tạm dừng")
+        self._sim_timer.start()
+
+    def _sim_pause(self):
+        self._sim_running = False
+        if self._sim_total_duration > 0 and self._sim_current_time >= self._sim_total_duration - 0.01:
+            self.btn_sim_play.setText("▶ Chạy lại")
+        else:
+            self.btn_sim_play.setText("▶ Tiếp tục")
+        self._sim_timer.stop()
+
+    def _sim_stop(self):
+        self._sim_pause()
+        self._sim_current_time = 0.0
+        self.btn_sim_play.setText("▶ Chạy thử")
+        self.slider_sim_progress.blockSignals(True)
+        self.slider_sim_progress.setValue(0)
+        self.slider_sim_progress.blockSignals(False)
+        self.canvas.hide_tool()
+        self.canvas.clear_sim_trail()
+        self._highlight_simulation_line(-1)
+        self.lbl_sim_hud.setText("")
+        self._last_highlighted_sim_line = None
+
+    def _sim_step_forward(self):
+        if not self._sim_trajectory:
+            self._render()
+            if not self._sim_trajectory:
+                return
+        self._sim_pause()
+        for item in self._sim_trajectory:
+            if item["end_time"] > self._sim_current_time + 0.01:
+                self._sim_current_time = item["end_time"]
+                break
+        else:
+            self._sim_current_time = self._sim_total_duration
+        self._sim_apply_state(self._sim_current_time)
+
+    def _sim_step_backward(self):
+        if not self._sim_trajectory:
+            return
+        self._sim_pause()
+        prev_time = 0.0
+        for item in self._sim_trajectory:
+            if item["start_time"] < self._sim_current_time - 0.05:
+                prev_time = item["start_time"]
+            else:
+                break
+        self._sim_current_time = prev_time
+        self._sim_apply_state(self._sim_current_time)
+
+    def _sim_on_slider_pressed(self):
+        self._sim_is_seeking = True
+        self._was_playing_before_seek = self._sim_running
+        if self._sim_running:
+            self._sim_timer.stop()
+
+    def _sim_on_slider_released(self):
+        self._sim_is_seeking = False
+        if getattr(self, "_was_playing_before_seek", False):
+            self._sim_timer.start()
+
+    def _sim_on_slider_moved(self, val: int):
+        if self._sim_total_duration <= 0:
+            return
+        self._sim_current_time = (val / 1000.0) * self._sim_total_duration
+        self._sim_apply_state(self._sim_current_time)
+
+    def _sim_on_speed_changed(self):
+        text = self.combo_sim_speed.currentText().replace("x", "")
+        try:
+            self._sim_speed_multiplier = float(text)
+        except ValueError:
+            self._sim_speed_multiplier = 1.0
+
+    def _sim_get_state_at_time(self, t_query: float):
+        if not self._sim_trajectory:
+            return 0.0, 0.0, False, -1, "", []
+
+        t_query = max(0.0, min(self._sim_total_duration, t_query))
+
+        idx = 0
+        for i, item in enumerate(self._sim_trajectory):
+            if item["start_time"] <= t_query <= item["end_time"]:
+                idx = i
+                break
+            if t_query > item["end_time"]:
+                idx = i
+
+        item = self._sim_trajectory[idx]
+        seg = item["seg"]
+        dur = max(0.0001, item["duration"])
+        frac = max(0.0, min(1.0, (t_query - item["start_time"]) / dur))
+
+        if seg.kind == "line":
+            x = seg.x0 + frac * (seg.x1 - seg.x0)
+            y = seg.y0 + frac * (seg.y1 - seg.y0)
+        else:
+            angle = item["a0"] + frac * (item["a1"] - item["a0"])
+            x = seg.cx + item["r0"] * math.cos(angle)
+            y = seg.cy + item["r0"] * math.sin(angle)
+
+        trail_pts = []
+        for j in range(idx):
+            trail_pts.extend(self._sim_trajectory[j]["sub_pts"])
+        if seg.kind == "line":
+            trail_pts.append((seg.x0, seg.y0))
+            trail_pts.append((x, y))
+        else:
+            cur_arc_pts = arc_to_polyline(seg, max_segments=32)
+            n_samples = max(2, int(len(cur_arc_pts) * frac))
+            trail_pts.extend(cur_arc_pts[:n_samples])
+            trail_pts.append((x, y))
+
+        status_text = f"[{'G0 Nhanh' if seg.rapid else 'G1 Cắt'}] Dòng {seg.source_line} | X {x:.2f} Y {y:.2f}"
+        return x, y, seg.rapid, seg.source_line, status_text, trail_pts
+
+    def _sim_apply_state(self, t: float):
+        if not self._sim_trajectory:
+            return
+        x, y, is_rapid, line_num, hud_text, trail_pts = self._sim_get_state_at_time(t)
+
+        self.canvas.set_tool_position(x, y, is_rapid=is_rapid, visible=True)
+        self.canvas.update_sim_trail(trail_pts)
+        self.lbl_sim_hud.setText(hud_text)
+
+        if not getattr(self, "_sim_is_seeking", False) and self._sim_total_duration > 0:
+            val = int((t / self._sim_total_duration) * 1000)
+            self.slider_sim_progress.blockSignals(True)
+            self.slider_sim_progress.setValue(val)
+            self.slider_sim_progress.blockSignals(False)
+
+        if line_num > 0 and line_num != getattr(self, "_last_highlighted_sim_line", None):
+            self._last_highlighted_sim_line = line_num
+            self._highlight_simulation_line(line_num)
+            self._sync_points_table_row(line_num)
+
+    def _sim_tick(self):
+        if not self._sim_running or self._sim_total_duration <= 0:
+            return
+
+        dt = 0.033
+        self._sim_current_time += dt * self._sim_speed_multiplier
+
+        if self._sim_current_time >= self._sim_total_duration:
+            self._sim_current_time = self._sim_total_duration
+            self._sim_apply_state(self._sim_current_time)
+            self._sim_pause()
+            self.lbl_sim_hud.setText("Hoàn thành mô phỏng.")
+            self.btn_sim_play.setText("▶ Chạy lại")
+            return
+
+        self._sim_apply_state(self._sim_current_time)
+
+    def _highlight_simulation_line(self, line_num: int):
+        self.editor.set_simulation_line(line_num)
+
+    def _sync_points_table_row(self, line_num: int):
+        self.table_points.blockSignals(True)
+        for row in range(self.table_points.rowCount()):
+            item = self.table_points.item(row, 0)
+            if item:
+                src_line, _, _ = item.data(Qt.UserRole)
+                if src_line == line_num:
+                    self.table_points.selectRow(row)
+                    self.table_points.scrollToItem(item)
+                    break
+        self.table_points.blockSignals(False)
+
     # ---------------- file I/O ----------------
 
     def _new_file(self):
@@ -830,6 +1296,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
             if reply != QMessageBox.Yes:
                 return
+        self._sim_stop()
         mode_line = "G90" if self.absolute_mode else "G91"
         self.editor.setPlainText(mode_line + "\n")
         self.last_ref_point = (0.0, 0.0)
@@ -844,6 +1311,7 @@ class MainWindow(QMainWindow):
             "All files (*);;Text files (*.txt *.nc *.gcode)")
         if not path:
             return
+        self._sim_stop()
         try:
             with open(path, "r", encoding="utf-8") as f:
                 self.editor.setPlainText(f.read())
@@ -978,18 +1446,11 @@ class MainWindow(QMainWindow):
 
 
 def main():
+    if sys.platform.startswith("linux") and not os.environ.get("QT_QPA_PLATFORM"):
+        os.environ["QT_QPA_PLATFORM"] = "xcb"
     app = QApplication(sys.argv)
     win = MainWindow()
     win.showMaximized()
-    # Tren mot so window manager Linux (vd lop tuong thich X11 cua Wayland),
-    # trang thai Qt.WindowMaximized bi WM bo qua hoan toan du goi bao nhieu
-    # lan/luc nao - giai phap chac chan hon la TU set kich thuoc cua so bang
-    # dung kich thuoc man hinh hien tai (khong dua vao WM hieu dung "maximize"
-    # la gi nua). Van goi showMaximized() truoc (de co UI dung cua trang thai
-    # maximized - vd nut khoi phuc) roi ghi de bang geometry man hinh day du.
-    screen = app.primaryScreen()
-    if screen is not None:
-        win.setGeometry(screen.availableGeometry())
     sys.exit(app.exec_())
 
 

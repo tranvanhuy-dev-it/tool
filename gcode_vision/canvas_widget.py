@@ -11,9 +11,9 @@ man hinh mac dinh cua Qt (goc tren trai, Y huong xuong) -> can quy doi.
 
 from PyQt5.QtWidgets import (
     QGraphicsView, QGraphicsScene, QGraphicsLineItem, QGraphicsPixmapItem,
-    QGraphicsEllipseItem, QGraphicsItem,
+    QGraphicsEllipseItem, QGraphicsItem, QGraphicsItemGroup, QGraphicsPathItem,
 )
-from PyQt5.QtGui import QPen, QColor, QBrush, QPainter, QFont, QPixmap
+from PyQt5.QtGui import QPen, QColor, QBrush, QPainter, QFont, QPixmap, QPainterPath
 from PyQt5.QtCore import Qt, QPointF, pyqtSignal, QRectF
 
 from gcode_vision.gcode_parser import ParseResult, Segment, arc_to_polyline
@@ -70,6 +70,8 @@ class CanvasWidget(QGraphicsView):
         self._guide_line_item = None  # duong ke tam thoi khi keo vach chia tren thuoc do
         self._measure_line_item = None  # doan thang tam thoi cua cong cu do khoang cach
         self._measure_dot_items: list = []
+        self._tool_group: QGraphicsItemGroup | None = None  # mui dao mo phong
+        self._sim_trail_item: QGraphicsPathItem | None = None  # vet cat mo phong
 
         # --- anh nen (ban ve tham chieu, da duoc crop khop khung phoi) ---
         # Quy uoc: goc DUOI-TRAI cua anh (pixel (0, image_height)) la moc tham chieu.
@@ -336,6 +338,8 @@ class CanvasWidget(QGraphicsView):
         self._guide_line_item = None
         self._measure_line_item = None
         self._measure_dot_items = []
+        self._tool_group = None
+        self._sim_trail_item = None
         self.scene.clear()
         self._redraw_background()
         self._segments = result.segments
@@ -758,3 +762,93 @@ class CanvasWidget(QGraphicsView):
     @property
     def last_click_mm(self):
         return self._last_click_mm
+
+    # ---------- mo phong mui dao CNC ----------
+
+    def set_tool_position(self, x_mm: float, y_mm: float, is_rapid: bool = False, visible: bool = True):
+        """Dat vi tri mui dao mo phong (mm, tuyet doi). Tu dong tao hoac cap nhat hien thi."""
+        if not visible:
+            if getattr(self, "_tool_group", None) is not None:
+                self._tool_group.setVisible(False)
+            return
+
+        p = self.real_mm_to_scene(x_mm, y_mm)
+        tool_r = 10.0  # Ban kinh hien thi mui dao (pixel)
+
+        if getattr(self, "_tool_group", None) is None or self._tool_group.scene() is None:
+            self._tool_group = QGraphicsItemGroup()
+            self._tool_group.setZValue(250)  # Luon noi tren tat ca net ve khac
+
+            # Vong ngoai mui dao
+            self._tool_body = QGraphicsEllipseItem(-tool_r, -tool_r, 2 * tool_r, 2 * tool_r)
+            self._tool_group.addToGroup(self._tool_body)
+
+            # Duong chu thap crosshair
+            self._tool_line_h = QGraphicsLineItem(-tool_r * 1.3, 0, tool_r * 1.3, 0)
+            self._tool_line_v = QGraphicsLineItem(0, -tool_r * 1.3, 0, tool_r * 1.3)
+            self._tool_group.addToGroup(self._tool_line_h)
+            self._tool_group.addToGroup(self._tool_line_v)
+
+            # Cham sang tam dao
+            self._tool_center = QGraphicsEllipseItem(-2.5, -2.5, 5, 5)
+            self._tool_group.addToGroup(self._tool_center)
+
+            self.scene.addItem(self._tool_group)
+
+        # Mau sac truc quan theo trang thai G0 (chay nhanh) vs G1/G2/G3 (dang cat)
+        if is_rapid:
+            body_pen = QPen(QColor("#f59e0b"), 2.0)
+            body_brush = QBrush(QColor(245, 158, 11, 75))
+            cross_pen = QPen(QColor("#fbbf24"), 1.2)
+            dot_brush = QBrush(QColor("#ffffff"))
+        else:
+            body_pen = QPen(QColor("#10b981"), 2.2)
+            body_brush = QBrush(QColor(16, 185, 129, 90))
+            cross_pen = QPen(QColor("#34d399"), 1.2)
+            dot_brush = QBrush(QColor("#ffffff"))
+
+        self._tool_body.setPen(body_pen)
+        self._tool_body.setBrush(body_brush)
+        self._tool_line_h.setPen(cross_pen)
+        self._tool_line_v.setPen(cross_pen)
+        self._tool_center.setPen(QPen(Qt.NoPen))
+        self._tool_center.setBrush(dot_brush)
+
+        self._tool_group.setPos(p.x(), p.y())
+        self._tool_group.setVisible(True)
+
+    def hide_tool(self):
+        """An mui dao mo phong."""
+        if getattr(self, "_tool_group", None) is not None:
+            self._tool_group.setVisible(False)
+
+    def update_sim_trail(self, path_points: list):
+        """Cap nhat vet cat hien tai (trail) de nguoi dung thay ro doan da cat."""
+        if not path_points or len(path_points) < 2:
+            if getattr(self, "_sim_trail_item", None) is not None:
+                self._sim_trail_item.setVisible(False)
+            return
+
+        path = QPainterPath()
+        p0 = self.real_mm_to_scene(path_points[0][0], path_points[0][1])
+        path.moveTo(p0)
+        for x, y in path_points[1:]:
+            pt = self.real_mm_to_scene(x, y)
+            path.lineTo(pt)
+
+        if getattr(self, "_sim_trail_item", None) is None or self._sim_trail_item.scene() is None:
+            self._sim_trail_item = QGraphicsPathItem()
+            self._sim_trail_item.setZValue(180)
+            pen = QPen(QColor("#10b981"), 2.4)
+            pen.setCapStyle(Qt.RoundCap)
+            pen.setJoinStyle(Qt.RoundJoin)
+            self._sim_trail_item.setPen(pen)
+            self.scene.addItem(self._sim_trail_item)
+
+        self._sim_trail_item.setPath(path)
+        self._sim_trail_item.setVisible(True)
+
+    def clear_sim_trail(self):
+        """Xoa vet cat mo phong."""
+        if getattr(self, "_sim_trail_item", None) is not None:
+            self._sim_trail_item.setVisible(False)
