@@ -12,6 +12,7 @@ man hinh mac dinh cua Qt (goc tren trai, Y huong xuong) -> can quy doi.
 from PyQt5.QtWidgets import (
     QGraphicsView, QGraphicsScene, QGraphicsLineItem, QGraphicsPixmapItem,
     QGraphicsEllipseItem, QGraphicsItem, QGraphicsItemGroup, QGraphicsPathItem,
+    QGraphicsSimpleTextItem,
 )
 from PyQt5.QtGui import QPen, QColor, QBrush, QPainter, QFont, QPixmap, QPainterPath
 from PyQt5.QtCore import Qt, QPointF, pyqtSignal, QRectF
@@ -68,8 +69,10 @@ class CanvasWidget(QGraphicsView):
         self._pen_hover_line = QPen(QColor(self._colors["hover"]), 1.2, Qt.DashLine)
         self._last_grid_bounds = (0.0, 0.0, 0.0, 0.0)  # min_x,max_x,min_y,max_y cua luoi hien tai
         self._guide_line_item = None  # duong ke tam thoi khi keo vach chia tren thuoc do
-        self._measure_line_item = None  # doan thang tam thoi cua cong cu do khoang cach
-        self._measure_dot_items: list = []
+        self._measure_preview_items: list = []  # nhom item (line+dots+label) cua duong DANG do, bam theo chuot
+        self._saved_measure_lines: dict = {}  # line_id -> list[item] HIEN TAI dang ve tren scene (item se mat khi render_program() xoa scene)
+        self._saved_measure_data: dict = {}  # line_id -> (x0,y0,x1,y1,dist) DU LIEU GOC, khong bao gio mat, dung de VE LAI item sau moi lan render_program()
+        self._measure_decimals = 2
         self._tool_group: QGraphicsItemGroup | None = None  # mui dao mo phong
         self._sim_trail_item: QGraphicsPathItem | None = None  # vet cat mo phong
 
@@ -319,8 +322,15 @@ class CanvasWidget(QGraphicsView):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        if not getattr(self, '_user_has_zoomed', False) and getattr(self, '_has_fitted_once', False):
-            self.fit_view()
+        # KHONG tu dong fit_view() lai o day nua, du nguoi dung chua tung tu
+        # zoom tay. Truoc day dieu kien nay khien MOI lan G-code thay doi (vd
+        # click chen 1 toa do moi) va lam layout resize (vd bang "duong do da
+        # luu" xuat hien/an) se TU DONG zoom lai theo _main_bounds_mm MOI (da
+        # mo rong ra de chua diem vua chen) - gay cam giac "luoi tu nhien nho
+        # lai" moi lan click, du nguoi dung khong he chu dong zoom/resize gi.
+        # fit_view() gio CHI con duoc goi o dung 1 cho: lan render dau tien
+        # (xem render_program(), _has_fitted_once) - sau do nguoi dung toan
+        # quyen kiem soat zoom/pan, khong bi ghi de tu dong nua.
         self.view_changed.emit()
 
     def scrollContentsBy(self, dx, dy):
@@ -336,14 +346,21 @@ class CanvasWidget(QGraphicsView):
         self._bg_pixmap_item = None  # da bi xoa boi scene.clear()
         self._hover_marker_items = []
         self._guide_line_item = None
-        self._measure_line_item = None
-        self._measure_dot_items = []
+        self._measure_preview_items = []
         self._tool_group = None
         self._sim_trail_item = None
         self.scene.clear()
         self._redraw_background()
         self._segments = result.segments
         self._known_points_mm = self._collect_known_points(result.segments)
+        # scene.clear() da huy toan bo QGraphicsItem cu, ke ca cac duong do
+        # DA LUU (saved) - phai VE LAI tu du lieu toa do goc (_saved_measure_data,
+        # khong bao gio bi xoa boi render_program) de chung tiep tuc hien thi
+        # VINH VIEN tren canvas xuyen suot moi lan G-code duoc render lai.
+        self._saved_measure_lines = {}
+        for line_id, (x0, y0, x1, y1, dist) in self._saved_measure_data.items():
+            items = self._draw_measure_group(x0, y0, x1, y1, dist, self._measure_decimals)
+            self._saved_measure_lines[line_id] = items
 
         # Khi chua co doan G-code nao (vd vua mo ung dung, editor con trong), hien thi
         # san mot he truc toa do co kich thuoc mac dinh de nguoi dung de hinh dung,
@@ -402,7 +419,22 @@ class CanvasWidget(QGraphicsView):
         self.scene.addEllipse(p.x() - r, p.y() - r, 2 * r, 2 * r,
                                QPen(QColor("#16a34a"), 1.5))
 
-        rect = self.scene.itemsBoundingRect().adjusted(-10, -10, 10, 10)
+        # KHONG dung itemsBoundingRect() (bao gom CA cac duong do da luu, co
+        # the nam rat xa vung G-code chinh) de tinh sceneRect - neu khong,
+        # sceneRect se bi keo gian ra rat lon, lam vung nhin duoc lon hon
+        # nhieu so voi noi dung chinh va tao cam giac "o luoi nho lai" (ty le
+        # zoom logic khong doi, nhung ty le TUONG DOI so voi khung nhin thi
+        # nho han han). Dung DUNG vung grid/phoi/G-code (min_x..max_y) da
+        # tinh o tren, hoan toan doc lap voi vi tri cac duong do.
+        rect = QRectF(min_x, min_y, max_x - min_x, max_y - min_y)
+        # Neu co duong do nam NGOAI vung nay, van phai mo rong sceneRect DU
+        # DE chua het (tranh Qt tu dong cat/an mat item nam ngoai sceneRect),
+        # nhung KHONG dung no de quyet dinh ty le zoom/fit - chi hop (union)
+        # them cho DU HIEN THI, khong anh huong _last_grid_bounds da co san.
+        items_rect = self.scene.itemsBoundingRect()
+        if not items_rect.isEmpty():
+            rect = rect.united(items_rect)
+        rect = rect.adjusted(-10, -10, 10, 10)
         self.scene.setSceneRect(rect)
 
         # CHI can khung nhin tu dong o lan render DAU TIEN (vd luc vua mo file/vua go
@@ -504,19 +536,27 @@ class CanvasWidget(QGraphicsView):
             self.scene.removeItem(self._guide_line_item)
             self._guide_line_item = None
 
-    # ---------- cong cu do khoang cach tam thoi (khong chen vao G-code) ----------
+    # ---------- cong cu do khoang cach (khong chen vao G-code) ----------
+    #
+    # 2 loai duong do khac nhau:
+    #   - "preview": 1 duong DUY NHAT, bam theo con tro chuot trong luc nguoi
+    #     dung dang keo (da click diem dau, chua click diem thu 2) - thay the
+    #     lien tuc moi lan chuot di chuyen.
+    #   - "saved": danh sach NHIEU duong DA DO XONG, hien thi VINH VIEN tren
+    #     canvas (den khi nguoi dung tu xoa qua bang), KHONG bi mat khi do
+    #     duong khac hoac tat che do do - moi duong co 1 "id" rieng (do
+    #     main_window quan ly) de biet xoa dung duong nao khoi canvas.
 
-    def show_measure_line(self, x0_mm: float, y0_mm: float, x1_mm: float, y1_mm: float):
-        """Ve 1 doan thang tam thoi giua 2 diem (mm THAT) de nguoi dung xem
-        truoc khoang cach/goc - KHONG lien quan gi den G-code, chi la cong cu
-        do dac tham khao tren canvas. Goi lai voi diem moi se thay the doan cu."""
-        self.clear_measure_line()
+    def _draw_measure_group(self, x0_mm, y0_mm, x1_mm, y1_mm, dist_mm, nd: int):
+        """Ve 1 nhom (line + 2 dots + nhan khoang cach) giua 2 diem, tra ve
+        list cac QGraphicsItem da tao (de luu lai/xoa sau nay)."""
+        items = []
         pen = QPen(QColor("#f97316"), 1.6, Qt.DashLine)
         p0 = self.real_mm_to_scene(x0_mm, y0_mm)
         p1 = self.real_mm_to_scene(x1_mm, y1_mm)
         line = self.scene.addLine(p0.x(), p0.y(), p1.x(), p1.y(), pen)
         line.setZValue(70)
-        self._measure_line_item = line
+        items.append(line)
 
         r = self._marker_radius_px * 0.7
         for pt in (p0, p1):
@@ -525,15 +565,60 @@ class CanvasWidget(QGraphicsView):
             dot.setFlag(QGraphicsItem.ItemIgnoresTransformations, True)
             dot.setPos(pt)
             dot.setZValue(71)
-            self._measure_dot_items.append(dot)
+            items.append(dot)
 
-    def clear_measure_line(self):
-        if self._measure_line_item is not None:
-            self.scene.removeItem(self._measure_line_item)
-            self._measure_line_item = None
-        for item in self._measure_dot_items:
+        label = QGraphicsSimpleTextItem(f"{dist_mm:.{nd}f} mm")
+        label.setBrush(QBrush(QColor("#f97316")))
+        font = label.font()
+        font.setBold(True)
+        label.setFont(font)
+        label.setFlag(QGraphicsItem.ItemIgnoresTransformations, True)
+        mid = QPointF((p0.x() + p1.x()) / 2.0, (p0.y() + p1.y()) / 2.0)
+        label.setPos(mid.x() + 6, mid.y() - 18)
+        label.setZValue(72)
+        self.scene.addItem(label)
+        items.append(label)
+
+        return items
+
+    def show_measure_preview(self, x0_mm, y0_mm, x1_mm, y1_mm):
+        """Cap nhat duong PREVIEW (bam theo chuot) - goi lien tuc moi lan
+        chuot di chuyen trong luc dang cho click diem thu 2. Luon THAY THE
+        preview cu, KHONG anh huong gi den cac duong DA LUU (saved)."""
+        self.clear_measure_preview()
+        dx, dy = x1_mm - x0_mm, y1_mm - y0_mm
+        dist = (dx * dx + dy * dy) ** 0.5
+        self._measure_preview_items = self._draw_measure_group(
+            x0_mm, y0_mm, x1_mm, y1_mm, dist, self._measure_decimals)
+
+    def clear_measure_preview(self):
+        for item in self._measure_preview_items:
             self.scene.removeItem(item)
-        self._measure_dot_items = []
+        self._measure_preview_items = []
+
+    def set_measure_decimals(self, nd: int):
+        self._measure_decimals = max(0, nd)
+
+    def add_saved_measure_line(self, line_id, x0_mm, y0_mm, x1_mm, y1_mm, dist_mm):
+        """Them 1 duong do DA HOAN TAT vao canvas, HIEN THI VINH VIEN (den
+        khi remove_saved_measure_line() duoc goi voi dung line_id nay, hoac
+        con tiep tuc hien thi qua moi lan render_program() ve lai G-code).
+        line_id la khoa QUAN LY TU BEN NGOAI (main_window), thuong la id
+        cua dong tuong ung trong bang danh sach duong do."""
+        self._saved_measure_data[line_id] = (x0_mm, y0_mm, x1_mm, y1_mm, dist_mm)
+        items = self._draw_measure_group(x0_mm, y0_mm, x1_mm, y1_mm, dist_mm, self._measure_decimals)
+        self._saved_measure_lines[line_id] = items
+
+    def remove_saved_measure_line(self, line_id):
+        self._saved_measure_data.pop(line_id, None)
+        items = self._saved_measure_lines.pop(line_id, None)
+        if items:
+            for item in items:
+                self.scene.removeItem(item)
+
+    def clear_all_saved_measure_lines(self):
+        for line_id in list(self._saved_measure_lines.keys()):
+            self.remove_saved_measure_line(line_id)
 
     # ---------- tuong tac chuot ----------
     #

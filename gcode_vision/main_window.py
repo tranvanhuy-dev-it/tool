@@ -84,6 +84,7 @@ class MainWindow(QMainWindow):
 
         self.absolute_mode = True   # True = G90, False = G91
         self.last_ref_point = (0.0, 0.0)  # diem tham chieu cho che do tuong doi
+        self._last_inserted_coord = None  # (vi_tri_bat_dau, do_dai) cua doan X/Y vua chen, de "hoan tac" chi xoa dung phan nay
         self._base_app_font_pt = QApplication.font().pointSize()
         self.ui_scale_pct = 100
         self._ruler_calib_x = None  # (pixel_positions, mm_positions) neu da hieu chuan thuoc chi tiet
@@ -195,9 +196,36 @@ class MainWindow(QMainWindow):
         points_layout.addWidget(self.table_points)
         points_panel.setVisible(False)
         left_splitter.addWidget(points_panel)
-        left_splitter.setSizes([1, 0])
+
+        # Bang "Duong do da luu" tu cong cu Do khoang cach: moi lan do xong
+        # (click du 2 diem), CA DUONG (2 toa do + khoang cach) duoc them vao
+        # day. Duong tuong ung cung duoc VE VINH VIEN tren canvas (xem
+        # canvas.add_saved_measure_line), xoa 1 dong trong bang se xoa CA
+        # DUONG do khoi canvas. Panel nay CHI HIEN khi co it nhat 1 dong -
+        # AN HOAN TOAN (khong chiem khong gian gi) khi bang rong, xem
+        # _update_pinned_panel_visibility() duoc goi moi lan bang thay doi.
+        self.pinned_panel = QWidget()
+        pinned_layout = QVBoxLayout(self.pinned_panel)
+        pinned_layout.setContentsMargins(0, 0, 0, 0)
+        pinned_layout.addWidget(QLabel("Đường đo đã lưu"))
+        self.table_pinned_points = QTableWidget(0, 4)
+        self.table_pinned_points.setHorizontalHeaderLabels(["Điểm 1", "Điểm 2", "Khoảng cách", ""])
+        self.table_pinned_points.horizontalHeader().setStretchLastSection(False)
+        self.table_pinned_points.setColumnWidth(3, 30)
+        self.table_pinned_points.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table_pinned_points.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table_pinned_points.verticalHeader().setVisible(False)
+        pinned_layout.addWidget(self.table_pinned_points)
+        btn_clear_pinned = QPushButton("Xoá tất cả")
+        self.btn_clear_pinned_points = btn_clear_pinned
+        pinned_layout.addWidget(btn_clear_pinned)
+        self.pinned_panel.setVisible(False)
+        left_splitter.addWidget(self.pinned_panel)
+
+        left_splitter.setSizes([1, 0, 260])
         left_splitter.setStretchFactor(0, 1)
         left_splitter.setStretchFactor(1, 0)
+        left_splitter.setStretchFactor(2, 0)
 
         left_layout.addWidget(left_splitter)
         self.splitter.addWidget(left)
@@ -529,6 +557,7 @@ class MainWindow(QMainWindow):
         self.canvas.point_clicked.connect(self._on_canvas_clicked)
         self.chk_measure_mode.toggled.connect(self._on_measure_mode_toggled)
         self.table_points.itemSelectionChanged.connect(self._on_point_row_selected)
+        self.btn_clear_pinned_points.clicked.connect(self._clear_pinned_points)
         self.canvas.undo_requested.connect(self._on_canvas_undo)
         self.canvas.mouse_moved_mm.connect(self._on_canvas_mouse_moved)
         self.chk_snap.toggled.connect(self.canvas.set_snap_enabled)
@@ -695,7 +724,14 @@ class MainWindow(QMainWindow):
         #         error_lines[int(m.group(1))] = w
         self.editor.set_error_lines({})
 
-        self.canvas.render_program(result)
+        # Truyen DUNG Rong/Cao phoi da khai bao (spin_width/spin_height) lam
+        # sheet_w/sheet_h - de vung luoi/khung nhin LUON theo dung kich thuoc
+        # phoi CO DINH nguoi dung da dat, KHONG tu dong co/gian theo pham vi
+        # thuc te cua cac doan G-code hien co (truoc day khong truyen gi ca,
+        # khien luoi bi "crop" vua khit diem xa nhat trong G-code, sai voi
+        # kich thuoc phoi that su nguoi dung da nhap trong panel).
+        self.canvas.render_program(
+            result, sheet_w=self.spin_width.value(), sheet_h=self.spin_height.value())
         self.last_ref_point = (result.end_x, result.end_y)
         nd = self.spin_decimals.value()
         self._refresh_points_table(result.segments, nd)
@@ -751,10 +787,10 @@ class MainWindow(QMainWindow):
                 self.editor.setTextCursor(cursor)
                 self.editor.setFocus()
 
-        # highlight diem tren canvas bang chinh co che do khoang cach (mot
-        # dau cham don, khong ve doan noi) - tai dung 1 diem thi khong can
-        # ve doan, chi can hien 1 marker de nguoi dung thay ro vi tri.
-        self.canvas.show_measure_line(x_mm, y_mm, x_mm, y_mm)
+        # highlight diem tren canvas (mot dau cham don, khong ve doan noi) -
+        # tai dung 1 diem thi khong can ve doan, chi can hien 1 marker TAM
+        # THOI (preview) de nguoi dung thay ro vi tri, khong luu lai.
+        self.canvas.show_measure_preview(x_mm, y_mm, x_mm, y_mm)
 
     @staticmethod
     def _format_machining_time(segments) -> str:
@@ -947,9 +983,11 @@ class MainWindow(QMainWindow):
 
     def _on_measure_mode_toggled(self, checked: bool):
         self._measure_first_point = None
-        self.canvas.clear_measure_line()
+        self.canvas.clear_measure_preview()
+        # Cac duong DA LUU (saved) khong bi dong cham gi khi bat/tat che do do
+        # - chung tiep tuc hien thi tren canvas nhu binh thuong.
         if checked:
-            self.status.showMessage("Chế độ đo khoảng cách: click 2 điểm liên tiếp trên bản vẽ.")
+            self.status.showMessage("Chế độ đo khoảng cách: click điểm đầu, di chuột để xem trước, click điểm thứ hai để lưu.")
 
     def _on_canvas_clicked(self, x_mm: float, y_mm: float):
         if self.chk_measure_mode.isChecked():
@@ -958,17 +996,16 @@ class MainWindow(QMainWindow):
         self._insert_coordinate(x_mm, y_mm)
 
     def _on_measure_click(self, x_mm: float, y_mm: float):
-        """Cong cu do khoang cach/goc TAM THOI: click 2 diem lien tiep tren
-        canvas de xem khoang cach va goc giua chung, KHONG chen bat ky gi vao
-        G-code - chi de tham khao khi ve/can chinh. Click lan 3 se bat dau
-        1 phep do MOI (diem vua click tro thanh diem dau tien)."""
+        """Cong cu do khoang cach/goc: click diem DAU, di chuyen chuot se
+        thay duong noi + khoang cach bam theo con tro (preview), click diem
+        THU HAI se LUU LAI duong do do VINH VIEN tren canvas + vao bang -
+        KHONG chen gi vao G-code, chi la cong cu tham khao."""
         nd = self.spin_decimals.value()
         if self._measure_first_point is None:
             self._measure_first_point = (x_mm, y_mm)
-            self.canvas.clear_measure_line()
             self.status.showMessage(
                 f"Đo khoảng cách: điểm đầu X{x_mm:.{nd}f} Y{y_mm:.{nd}f} — "
-                f"click điểm thứ hai để xem khoảng cách."
+                f"di chuyển chuột để xem trước, click điểm thứ hai để lưu."
             )
             return
 
@@ -977,12 +1014,65 @@ class MainWindow(QMainWindow):
         dy = y_mm - y0
         dist = (dx * dx + dy * dy) ** 0.5
         angle_deg = math.degrees(math.atan2(dy, dx))
-        self.canvas.show_measure_line(x0, y0, x_mm, y_mm)
+        self.canvas.clear_measure_preview()
+        self._measure_first_point = None  # san sang cho phep do tiep theo
+
         self.status.showMessage(
-            f"Khoảng cách: {dist:.{nd}f} mm   Góc: {angle_deg:.2f}°   "
+            f"Đã lưu: khoảng cách {dist:.{nd}f} mm   Góc: {angle_deg:.2f}°   "
             f"(ΔX={dx:.{nd}f}  ΔY={dy:.{nd}f}) — click để đo đoạn mới."
         )
-        self._measure_first_point = None  # san sang cho phep do tiep theo
+        self._save_measure_line(x0, y0, x_mm, y_mm, dist)
+
+    def _on_measure_mouse_moved(self, x_mm: float, y_mm: float):
+        """Cap nhat duong PREVIEW bam theo con tro trong luc dang cho click
+        diem thu 2 - goi tu _on_canvas_mouse_moved() moi lan chuot di chuyen."""
+        if self._measure_first_point is None:
+            return
+        x0, y0 = self._measure_first_point
+        self.canvas.show_measure_preview(x0, y0, x_mm, y_mm)
+
+    _next_measure_line_id = 0
+
+    def _save_measure_line(self, x0, y0, x1, y1, dist):
+        """Luu 1 duong do da hoan tat: them vao canvas (hien thi vinh vien)
+        va vao bang danh sach ben trai."""
+        MainWindow._next_measure_line_id += 1
+        line_id = MainWindow._next_measure_line_id
+        self.canvas.add_saved_measure_line(line_id, x0, y0, x1, y1, dist)
+
+        nd = self.spin_decimals.value()
+        row = self.table_pinned_points.rowCount()
+        self.table_pinned_points.insertRow(row)
+        self.table_pinned_points.setItem(row, 0, QTableWidgetItem(f"{x0:.{nd}f}, {y0:.{nd}f}"))
+        self.table_pinned_points.setItem(row, 1, QTableWidgetItem(f"{x1:.{nd}f}, {y1:.{nd}f}"))
+        self.table_pinned_points.setItem(row, 2, QTableWidgetItem(f"{dist:.{nd}f} mm"))
+        btn_remove = QPushButton("✕")
+        btn_remove.setFixedWidth(26)
+        btn_remove.setToolTip("Xoá đường đo này")
+        btn_remove.clicked.connect(lambda: self._remove_pinned_row(btn_remove, line_id))
+        self.table_pinned_points.setCellWidget(row, 3, btn_remove)
+        self._update_pinned_panel_visibility()
+
+    def _remove_pinned_row(self, btn_remove, line_id):
+        """Xoa dong bang tuong ung (tim theo cellWidget, khong theo index co
+        dinh - vi cac dong khac co the da bi xoa lam lech index) VA xoa luon
+        duong do do khoi canvas (dong bo 2 chieu: bang <-> canvas)."""
+        for row in range(self.table_pinned_points.rowCount()):
+            if self.table_pinned_points.cellWidget(row, 3) is btn_remove:
+                self.table_pinned_points.removeRow(row)
+                break
+        self.canvas.remove_saved_measure_line(line_id)
+        self._update_pinned_panel_visibility()
+
+    def _clear_pinned_points(self):
+        self.table_pinned_points.setRowCount(0)
+        self.canvas.clear_all_saved_measure_lines()
+        self._update_pinned_panel_visibility()
+
+    def _update_pinned_panel_visibility(self):
+        """An hoan toan panel "Duong do da luu" (khong chiem khong gian gi)
+        khi bang rong - chi hien khi co it nhat 1 duong do da luu."""
+        self.pinned_panel.setVisible(self.table_pinned_points.rowCount() > 0)
 
     def _insert_coordinate(self, x_mm: float, y_mm: float):
         """Chen toa do vao vi tri con tro hien tai trong editor."""
@@ -1005,9 +1095,18 @@ class MainWindow(QMainWindow):
             char_before = self.editor.toPlainText()[pos - 1]
             if char_before not in (" ", "\t", "\n"):
                 snippet = " " + snippet
+        insert_start = cursor.position()
         cursor.insertText(snippet)
         self.editor.setTextCursor(cursor)
         self.editor.setFocus()
+
+        # Ghi nho CHINH XAC vi tri + do dai cua doan vua chen (khong dung
+        # editor.undo() chuan cua Qt) - de "hoan tac" (chuot phai tren canvas)
+        # chi XOA DUNG PHAN X/Y nay, khong dinh vao cac thao tac go phim khac
+        # (vd Qt co the gop lenh Enter tao dong N moi voi lenh chen X Y ngay
+        # sau do thanh 1 buoc undo duy nhat neu khong co gi ngat quang giua
+        # 2 thao tac, khien "hoan tac" xoa nham ca dong).
+        self._last_inserted_coord = (insert_start, len(snippet))
 
         self.last_ref_point = (x_mm, y_mm)
         self.status.showMessage(
@@ -1018,15 +1117,37 @@ class MainWindow(QMainWindow):
     def _on_canvas_undo(self):
         if self.chk_measure_mode.isChecked():
             self._measure_first_point = None
-            self.canvas.clear_measure_line()
+            self.canvas.clear_measure_preview()
             self.status.showMessage("Đã huỷ phép đo đang chọn.")
             return
+
+        if self._last_inserted_coord is not None:
+            # Xoa DUNG doan X/Y vua chen (theo vi tri + do dai da ghi nho),
+            # KHONG dung editor.undo() chuan cua Qt - vi Qt co the gop nham
+            # thao tac Enter/tao dong N moi voi lenh chen X/Y ngay sau do
+            # thanh 1 buoc undo duy nhat, khien "hoan tac" xoa mat ca dong N
+            # thay vi chi xoa toa do vua chen.
+            start, length = self._last_inserted_coord
+            text = self.editor.toPlainText()
+            if 0 <= start and start + length <= len(text):
+                cursor = self.editor.textCursor()
+                cursor.setPosition(start)
+                cursor.setPosition(start + length, cursor.KeepAnchor)
+                cursor.removeSelectedText()
+                self.editor.setTextCursor(cursor)
+                self.editor.setFocus()
+                self._last_inserted_coord = None
+                self.status.showMessage("Đã xoá tọa độ vừa chèn.")
+                return
+
         self.editor.undo()
         self.status.showMessage("Đã hoàn tác thao tác gần nhất.")
 
     def _on_canvas_mouse_moved(self, x_mm: float, y_mm: float):
         nd = self.spin_decimals.value()
         self.lbl_mouse_coord.setText(f"X {x_mm:.{nd}f}   Y {y_mm:.{nd}f}")
+        if self.chk_measure_mode.isChecked():
+            self._on_measure_mouse_moved(x_mm, y_mm)
 
     # ---------------- mau net ve ----------------
 
@@ -1302,6 +1423,7 @@ class MainWindow(QMainWindow):
         mode_line = "G90" if self.absolute_mode else "G91"
         self.editor.setPlainText(mode_line + "\n")
         self.last_ref_point = (0.0, 0.0)
+        self._last_inserted_coord = None
         self._current_file_path = None
         self._mark_clean()
         self.status.showMessage("Đã tạo chương trình G-code mới.")
@@ -1318,6 +1440,7 @@ class MainWindow(QMainWindow):
             with open(path, "r", encoding="utf-8") as f:
                 self.editor.setPlainText(f.read())
             self._current_file_path = path
+            self._last_inserted_coord = None
             self._mark_clean()
         except Exception as e:
             QMessageBox.warning(self, "Lỗi", f"Không thể mở file: {e}")

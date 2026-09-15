@@ -6,7 +6,7 @@
 ; (xem .github/workflows/build.yml) truoc khi chay script nay.
 
 #define MyAppName "GCode Vision"
-#define MyAppVersion "3.1.0"
+#define MyAppVersion "3.2.2"
 #define MyAppPublisher "Tran Van Huy"
 #define MyAppURL "https://www.tranvanhuy.io.vn"
 #define MyAppExeName "GCode-Vision.exe"

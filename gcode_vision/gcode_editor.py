@@ -259,8 +259,42 @@ class GcodeEditor(QPlainTextEdit):
             if cursor.block().text() == "":
                 cursor.insertText(self._format_n(next_n) + " ")
                 self.setTextCursor(cursor)
+                # Neu dong Enter nay duoc chen O GIUA mot day cac dong da
+                # danh so N (tuc la con dong N o PHIA SAU, chua bi day so N
+                # trung voi dong vua chen) - phai DANH SO LAI toan bo cac
+                # dong N tu day tro ve sau theo dung buoc nhay, neu khong se
+                # bi TRUNG SO N (vd chen giua N3/N4 se tao ra 2 dong N4).
+                self._renumber_following_lines(next_n)
             return
         super().keyPressEvent(event)
+
+    def _renumber_following_lines(self, just_inserted_n: int):
+        """Danh so lai LIEN TIEP (tang dan dung buoc nhay) cho tat ca cac dong
+        CO N o TU DONG NGAY SAU dong vua chen tro di, bat dau tu
+        just_inserted_n + step - dung ngay sau khi nguoi dung Enter chen 1
+        dong moi GIUA mot day da co san (vd N1..N7), de tranh trung so N
+        (chen giua N3/N4 se lam N4 cu thanh N5, N5 cu thanh N6, v.v...)."""
+        block = self.textCursor().block().next()
+        expected_n = just_inserted_n + self.auto_number_step
+        edit_cursor = QTextCursor(self.document())
+        edit_cursor.beginEditBlock()
+        try:
+            while block.isValid():
+                m = _N_PREFIX_RE.match(block.text())
+                if m:
+                    # Chi thay THE phan "N<so>" (khong dung khoang trang di
+                    # kem sau no), giu nguyen phan con lai cua dong.
+                    prefix_only = f"N{m.group(1)}"
+                    replace_start = block.position() + block.text().find(prefix_only)
+                    replace_cursor = QTextCursor(self.document())
+                    replace_cursor.setPosition(replace_start)
+                    replace_cursor.setPosition(
+                        replace_start + len(prefix_only), QTextCursor.KeepAnchor)
+                    replace_cursor.insertText(self._format_n(expected_n))
+                    expected_n += self.auto_number_step
+                block = block.next()
+        finally:
+            edit_cursor.endEditBlock()
 
     MIN_FONT_PT = 6
     MAX_FONT_PT = 48
