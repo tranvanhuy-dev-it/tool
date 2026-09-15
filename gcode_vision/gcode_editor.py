@@ -178,9 +178,14 @@ class GcodeEditor(QPlainTextEdit):
                     sel.format.setBackground(QColor(254, 226, 226, 180))
                     sel.format.setUnderlineColor(QColor("#dc2626"))
                     sel.format.setUnderlineStyle(QTextCharFormat.WaveUnderline)
-                cursor = QTextCursor(block)
-                cursor.movePosition(QTextCursor.EndOfBlock, QTextCursor.KeepAnchor)
-                sel.cursor = cursor
+                # Cursor KHONG duoc keo dai chon vung (khong dung KeepAnchor)
+                # - de trong (empty selection) chi danh dau 1 VI TRI tren dong.
+                # Cung voi FullWidthSelection=True, day la cach DUY NHAT de Qt
+                # to nen ca CHIEU RONG TOAN BO dong (ke ca phan khong co chu
+                # ben phai) - neu keo dai selection toi EndOfBlock, Qt chi to
+                # nen DUNG BANG do dai vung ky tu da chon, khong mo rong het
+                # chieu ngang du co dat FullWidthSelection.
+                sel.cursor = QTextCursor(block)
                 extra_selections.append(sel)
 
         # 2. Dong dang mo phong: to xanh la
@@ -193,9 +198,7 @@ class GcodeEditor(QPlainTextEdit):
                     sel.format.setBackground(QColor(16, 185, 129, 90))
                 else:
                     sel.format.setBackground(QColor(220, 252, 231, 200))
-                cursor = QTextCursor(block)
-                cursor.movePosition(QTextCursor.EndOfBlock, QTextCursor.KeepAnchor)
-                sel.cursor = cursor
+                sel.cursor = QTextCursor(block)
                 extra_selections.append(sel)
 
         self.setExtraSelections(extra_selections)
