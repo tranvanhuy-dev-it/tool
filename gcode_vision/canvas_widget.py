@@ -137,10 +137,20 @@ class CanvasWidget(QGraphicsView):
     def set_workpiece_size(self, width_mm: float, height_mm: float):
         """Kich thuoc THUC TE (mm) cua phoi, tuong ung voi toan bo chieu rong/cao
         cua anh da crop. Dung lam ty le mac dinh (1 doan don gian) cho ca truc X,
-        Y - bi ghi de neu nguoi dung da hieu chuan chi tiet bang thuoc do (xem
-        set_axis_calibration)."""
-        self._workpiece_w_mm = max(1e-6, width_mm)
-        self._workpiece_h_mm = max(1e-6, height_mm)
+        Y. Neu nguoi dung DA hieu chuan chi tiet bang thuoc do (nhieu doan) va
+        sau do moi doi lai Rong/Cao o day, calibration cu (tinh theo Rong/Cao
+        SAI truoc do) khong con dung nua - RESET ve mac dinh 1 doan theo gia tri
+        moi, thay vi giu nguyen cac vach da chia (se lam thuoc "dong bang" sai
+        ty le, khong cap nhat duoc) - nguoi dung se phai chia lai thuoc cho gia
+        tri Rong/Cao dung."""
+        new_w = max(1e-6, width_mm)
+        new_h = max(1e-6, height_mm)
+        if new_w != self._workpiece_w_mm and not self._calib_x.is_default():
+            self._calib_x = AxisCalibration()
+        if new_h != self._workpiece_h_mm and not self._calib_y.is_default():
+            self._calib_y = AxisCalibration()
+        self._workpiece_w_mm = new_w
+        self._workpiece_h_mm = new_h
         self._sync_default_calibration()
         self._redraw_background()
 

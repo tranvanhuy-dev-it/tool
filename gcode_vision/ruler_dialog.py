@@ -284,8 +284,19 @@ class RulerWidget(QWidget):
                 return seg_idx
         return None
 
+    def _has_valid_image(self) -> bool:
+        """True neu canvas da co anh nen that su (khong phai gia tri mac dinh
+        1.0x1.0 luc chua tai anh nao). Chan thao tac them/keo vach khi chua
+        co anh - neu khong, _breakpoints_img se van nam trong thang do mac
+        dinh [0,1] (chua tung duoc load_calibration() voi du lieu that), gay
+        loi tinh toan lo > hi trong mouseMoveEvent (vd lo=1.0, hi=0.0), khien
+        vach bi ep cung ve 1 dau moi lan keo thay vi di chuyen binh thuong."""
+        return getattr(self.canvas, "_bg_image_path", None) is not None
+
     def mousePressEvent(self, event: QMouseEvent):
         if event.button() != Qt.LeftButton:
+            return
+        if not self._has_valid_image():
             return
         # Nhan focus ve THUOC nay khi nguoi dung tuong tac, de phim tat Ctrl+Z
         # (bat trong keyPressEvent) hoat dong dung tren truc vua duoc sua, thay
@@ -299,13 +310,6 @@ class RulerWidget(QWidget):
             # thay doi vi tri, de Ctrl+Z co the khoi phuc lai dung vi tri cu.
             self._push_undo_snapshot()
             self._dragging_index = idx
-            # Grab chuot: dam bao mouseMoveEvent/mouseReleaseEvent VAN duoc
-            # widget nay nhan ngay ca khi con tro di ra ngoai bien thuoc (rat
-            # de xay ra vi thuoc chi day 26px) trong luc dang keo - neu khong
-            # Qt co the chuyen event sang widget khac (vd canvas ben duoi) va
-            # thuoc se "mat" cac su kien mouseMoveEvent tiep theo, tao cam
-            # giac "keo khong phan hoi gi ca" ngay sau khi bam.
-            self.grabMouse()
             return
 
         if idx is None:
@@ -363,12 +367,13 @@ class RulerWidget(QWidget):
         if self._dragging_index is None:
             return
         self._dragging_index = None
-        self.releaseMouse()
         # Da keo xong -> ap dung calibration ngay voi vi tri moi (khong mo
         # popup, dung y nguoi dung da chon xong vi tri bang mat qua guide line).
         self._emit_calibration()
 
     def mouseDoubleClickEvent(self, event: QMouseEvent):
+        if not self._has_valid_image():
+            return
         # Huy MOI popup dang cho tu mousePressEvent truoc do (chinh la cai press
         # dau tien cua cu double-click nay) - tang token de _maybe_open_popup()
         # tu bien mat khi timer no.
